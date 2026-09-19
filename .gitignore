@@ -1,4 +1,22 @@
+# Ignore java class files
+*.class
+
+# Ignore Video Files
 *.mp4
-*.class
-*.class
-*.class
+*.mov
+*.avi
+*.mkv
+
+# Ignore Image Files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+
+# Ignore database (so our photos aren't on the internet)
+/java-dashboard/incidents.db 
+
+# 2. Unignore the allowed folder structure so Git can read into it
+!assets/
+!assets/**
