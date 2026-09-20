@@ -1,0 +1,5 @@
+# The engine uses the MediaPipe Tasks HandLandmarker API from the 0.10 line.
+mediapipe>=0.10.30,<1.0
+opencv-python>=4.8.0,<5
+numpy>=1.26,<3
+websocket-client>=1.8.0,<2

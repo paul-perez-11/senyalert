@@ -25,13 +25,16 @@ def main():
     try:
         if sys.platform == "win32":
             java_proc = subprocess.Popen(
-                ["mvn", "clean", "compile", "exec:java"],
+                # Do not run Maven's clean phase here.  It adds startup time and
+                # removes useful local build output every time a classroom demo
+                # is started; compile will still rebuild changed sources.
+                ["mvn", "compile", "exec:java"],
                 cwd=java_dir,
                 shell=True
             )
         else:
             java_proc = subprocess.Popen(
-                ["mvn", "clean", "compile", "exec:java"],
+                ["mvn", "compile", "exec:java"],
                 cwd=java_dir
             )
         

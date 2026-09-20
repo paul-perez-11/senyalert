@@ -1,12 +1,75 @@
 {
-    "post_event_sec": 12,
-    "fingers": {
-        "middle": true,
-        "thumb": true,
-        "ring": true,
-        "pinky": true,
-        "index": true
+  "aspect_ratio": [
+    9,
+    16
+  ],
+  "people_detection_enabled": true,
+  "post_event_sec": 8,
+  "preview_resolution": [
+    540,
+    960
+  ],
+  "quiet_at_or_above_people": 2,
+  "camera_id": "CAM-02-PHONE",
+  "camera_type": "phone_rear",
+  "people_detection_interval_frames": 6,
+  "fingers": {
+    "middle": true,
+    "thumb": true,
+    "ring": true,
+    "pinky": true,
+    "index": true
+  },
+  "confidence_threshold": 0.5,
+  "resolution": [
+    1080,
+    1920
+  ],
+  "max_hands": 2,
+  "cameras": [
+    {
+      "aspect_ratio": [
+        16,
+        9
+      ],
+      "camera_source": "0",
+      "preview_resolution": [
+        854,
+        480
+      ],
+      "camera_id": "CAM-01-LAPTOP",
+      "camera_type": "laptop_webcam",
+      "location": "Public Intake Counter A",
+      "resolution": [
+        960,
+        540
+      ],
+      "enabled": false,
+      "processing_scale": 1
     },
-    "confidence_threshold": 0.79,
-    "pre_event_sec": 12
+    {
+      "aspect_ratio": [
+        9,
+        16
+      ],
+      "camera_source": "http://127.0.0.1:17170/video/mjpeg",
+      "preview_resolution": [
+        540,
+        960
+      ],
+      "camera_id": "CAM-02-PHONE",
+      "camera_type": "phone_rear",
+      "location": "Demo Phone",
+      "resolution": [
+        1080,
+        1920
+      ],
+      "enabled": true,
+      "processing_scale": 1
+    }
+  ],
+  "camera_source": "http://127.0.0.1:17170/video/mjpeg",
+  "location": "Demo Phone",
+  "audible_alerts_enabled": false,
+  "pre_event_sec": 8
 }
