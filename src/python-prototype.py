@@ -261,6 +261,22 @@ def camera_input_kind(source: Any) -> str:
     return "local webcam"
 
 
+def is_network_stream_source(source: Any) -> bool:
+    """Return whether a source can build an OpenCV decode backlog.
+
+    USB cameras are pulled directly by their driver, but HTTP MJPEG and RTSP
+    sources often continue producing frames while MediaPipe is busy.  The
+    network path therefore uses ``LatestFrameCapture`` below so the camera
+    worker never acts on a queue of already-old frames.
+    """
+    if not isinstance(source, str):
+        return False
+    try:
+        return urlsplit(source).scheme.lower() in {"http", "https", "rtsp", "rtsps"}
+    except ValueError:
+        return False
+
+
 def validate_camera_source(value: Any) -> Tuple[Optional[Any], Optional[str]]:
     """Accept a webcam index, UVC/raw-USB input, stream URL, or existing ADB device."""
     if isinstance(value, bool):
@@ -1902,6 +1918,151 @@ class AdbScreenCapture:
                 pass
 
 
+class LatestFrameCapture:
+    """Continuously drain a network capture and expose only its newest frame.
+
+    OpenCV may buffer several HTTP MJPEG or RTSP frames while a synchronous
+    consumer is busy running MediaPipe.  Returning every one of those frames
+    makes the engine visibly lag behind the phone even when the transport is
+    fast.  This adapter owns a dedicated reader thread and a one-frame slot:
+    anything superseded before the worker asks for it is deliberately dropped.
+
+    It is intentionally used only for network streams.  Local/UVC cameras keep
+    their normal OpenCV path, and ADB screen capture already has its own
+    request-per-frame implementation.
+    """
+
+    _FRAME_WAIT_SECONDS = 3.0
+
+    def __init__(self, capture: Any, source_label: str) -> None:
+        self._capture = capture
+        self._source_label = source_label
+        self._condition = threading.Condition(threading.RLock())
+        self._released = False
+        self._reader_finished = False
+        self._latest_frame: Optional[Any] = None
+        self._latest_sequence = 0
+        self._delivered_sequence = 0
+        self._last_error = ""
+        self._reader = threading.Thread(
+            target=self._reader_loop,
+            name="senyalert-network-frame-reader",
+            daemon=True,
+        )
+        self._reader.start()
+
+    @property
+    def last_error(self) -> str:
+        with self._condition:
+            return self._last_error
+
+    def isOpened(self) -> bool:
+        with self._condition:
+            return not self._released and bool(self._capture.isOpened())
+
+    def _reader_loop(self) -> None:
+        while True:
+            with self._condition:
+                if self._released:
+                    self._reader_finished = True
+                    self._condition.notify_all()
+                    return
+            try:
+                ok, frame = self._capture.read()
+            except Exception as exc:
+                with self._condition:
+                    if not self._released:
+                        self._last_error = f"Network stream read failed for {self._source_label}: {exc}"
+                    self._reader_finished = True
+                    self._condition.notify_all()
+                return
+
+            with self._condition:
+                if self._released:
+                    self._reader_finished = True
+                    self._condition.notify_all()
+                    return
+                if not ok or frame is None:
+                    self._last_error = f"Network stream ended or produced no frame for {self._source_label}"
+                    self._reader_finished = True
+                    self._condition.notify_all()
+                    return
+                # Assignment replaces the previous frame atomically while the
+                # lock is held.  A stalled detector therefore cannot make this
+                # queue grow beyond one decoded frame.
+                self._latest_frame = frame
+                self._latest_sequence += 1
+                self._last_error = ""
+                self._condition.notify_all()
+
+    def read(self) -> Tuple[bool, Optional[Any]]:
+        deadline = time.monotonic() + self._FRAME_WAIT_SECONDS
+        with self._condition:
+            while (
+                not self._released
+                and not self._reader_finished
+                and self._latest_sequence <= self._delivered_sequence
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    self._last_error = f"Timed out waiting for a new network frame from {self._source_label}"
+                    return False, None
+                self._condition.wait(remaining)
+
+            if self._released:
+                return False, None
+            if self._latest_frame is None or self._latest_sequence <= self._delivered_sequence:
+                if not self._last_error:
+                    self._last_error = f"Network stream stopped before a new frame arrived from {self._source_label}"
+                return False, None
+
+            self._delivered_sequence = self._latest_sequence
+            # The reader immediately asks OpenCV for another frame after it
+            # leaves the lock.  A defensive copy makes the consumer independent
+            # of an OpenCV backend that reuses its decode buffer.
+            return True, self._latest_frame.copy()
+
+    def get(self, property_id: int) -> float:
+        try:
+            return float(self._capture.get(property_id))
+        except Exception:
+            return 0.0
+
+    def release(self) -> None:
+        with self._condition:
+            if self._released:
+                return
+            self._released = True
+            self._condition.notify_all()
+        try:
+            # Releasing from this thread is the supported way to unblock a
+            # blocking VideoCapture.read() when a phone stream disappears.
+            self._capture.release()
+        except Exception:
+            pass
+        if threading.current_thread() is not self._reader:
+            self._reader.join(timeout=0.35)
+
+
+def _configure_network_capture_for_low_latency(capture: Any) -> None:
+    """Ask supporting OpenCV backends for a one-frame decode buffer.
+
+    CAP_PROP_BUFFERSIZE is backend-dependent (and may return False on some
+    Windows FFmpeg builds), so the latest-frame reader remains the correctness
+    mechanism.  This best-effort setting can still eliminate an extra native
+    buffer where the backend supports it.
+    """
+    buffer_property = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+    if buffer_property is None:
+        return
+    try:
+        capture.set(buffer_property, 1)
+    except cv2.error:
+        pass
+    except Exception:
+        pass
+
+
 def open_camera(source: Any, config: Dict[str, Any]) -> Any:
     if isinstance(source, str) and source.startswith("adb://"):
         serial = source[len("adb://"):]
@@ -1914,6 +2075,7 @@ def open_camera(source: Any, config: Dict[str, Any]) -> Any:
             capture_source = int(source[len("uvc://"):])
         except ValueError as exc:
             raise CameraSourceError("UVC source must use uvc://<webcam-index>") from exc
+    network_source = is_network_stream_source(capture_source)
     capture = cv2.VideoCapture(capture_source)
     if isinstance(capture_source, int):
         width, height = config["resolution"]
@@ -1922,6 +2084,9 @@ def open_camera(source: Any, config: Dict[str, Any]) -> Any:
     if not capture.isOpened():
         capture.release()
         return None
+    if network_source:
+        _configure_network_capture_for_low_latency(capture)
+        return LatestFrameCapture(capture, display_camera_source(capture_source))
     return capture
 
 
@@ -2470,11 +2635,15 @@ class CameraWorker:
                 "ADB screen-capture fallback is ready; waiting for its first frame. It is not raw phone-camera access.",
             )
             return True
-        self._send_camera_status(
-            "ONLINE",
-            config,
-            f"{camera_input_kind(config['camera_source'])} opened; waiting for the first decoded frame to report actual dimensions.",
-        )
+        source_kind = camera_input_kind(config["camera_source"])
+        if is_network_stream_source(config["camera_source"]):
+            detail = (
+                f"{source_kind} opened with newest-frame delivery; "
+                "waiting for the first decoded frame to report actual dimensions."
+            )
+        else:
+            detail = f"{source_kind} opened; waiting for the first decoded frame to report actual dimensions."
+        self._send_camera_status("ONLINE", config, detail)
         return True
 
     def _on_media_complete(self, recording: ActiveRecording, status: str) -> None:

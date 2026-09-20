@@ -126,6 +126,30 @@ SenyAlert deliberately does not run `adb connect` or change phone debugging
 settings itself. Pair/connect the device explicitly first, then configure the
 already-authorized ADB serial in Settings.
 
+### Raw Android IP Camera through ADB
+
+For an Android 12 phone without native USB Webcam/UVC support, use the
+open-source **Android IP Camera** app to serve the selected phone lens as MJPEG
+instead of using `adb://` screen capture. Start its local server, then forward
+its default phone port to a laptop-only port:
+
+```powershell
+adb -s <device-serial> forward tcp:17170 tcp:4444
+```
+
+Use `http://127.0.0.1:17170/video/mjpeg` as the SenyAlert camera source. Start
+at 1280 x 720, 15–20 FPS, medium JPEG quality, with audio and the app's own
+recording disabled. The Python engine continuously drains network streams and
+delivers only the latest decoded frame to detection, so a slow detector drops
+stale frames instead of growing visible latency. Reduce the camera's
+`processing_scale` to 0.5–0.75 if the local computer still cannot keep up.
+
+For a secure demo, prefer a USB data cable plus USB debugging. If the phone
+server uses HTTP without app authentication, keep it off public/campus Wi-Fi;
+ADB forwarding does not stop other devices on the phone's active network from
+reaching the app's server directly. Stop the server and remove the ADB forward
+after the demo.
+
 ### SenyAlert Camera Bridge — required where USB Webcam is unavailable
 
 `SenyAlert Camera Bridge` is the proposed **first-party Android companion**
@@ -157,9 +181,9 @@ Then add an HTTP camera in **Cameras** with a source such as
 different laptop-side port for each device (for example `17170` and `17171`)
 while each phone still listens on its own local `17170`.
 
-This bridge is the correct raw-camera solution for the current Android 12
-Galaxy S10 demo device. It needs an explicitly approved Android companion-app
-implementation and installation before it can be used.
+This is an optional first-party alternative to Android IP Camera for the
+current Android 12 Galaxy S10 demo device. It needs an explicitly approved
+Android companion-app implementation and installation before it can be used.
 
 ### HTTP/RTSP alternative
 
