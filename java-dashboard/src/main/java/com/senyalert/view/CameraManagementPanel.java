@@ -1,7 +1,9 @@
 package com.senyalert.view;
 
+import com.senyalert.model.AndroidIpCameraRequest;
 import com.senyalert.model.CameraSettings;
 import com.senyalert.model.EngineSettings;
+import com.senyalert.model.IpCameraZoomRequest;
 import com.senyalert.view.ui.BlueTheme;
 import com.senyalert.view.ui.RoundedPanel;
 import com.senyalert.view.ui.StyledButton;
@@ -12,8 +14,13 @@ import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -26,6 +33,7 @@ import javax.swing.JScrollPane;
 import javax.swing.JTabbedPane;
 import javax.swing.JTextField;
 import javax.swing.SwingConstants;
+import javax.swing.SwingUtilities;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import org.kordamp.ikonli.fontawesome6.FontAwesomeSolid;
@@ -37,11 +45,24 @@ final class CameraManagementPanel extends JPanel {
 
     private final JTabbedPane cameraTabs = new JTabbedPane();
     private final List<CameraSetupPanel> cameraEditors = new ArrayList<>();
+    /**
+     * Bridge credentials/ports are deliberately session-only. Wireless ADB
+     * targets are transient and should not be stored in the regular camera
+     * configuration, but saving a camera must not erase values the operator is
+     * using during this dashboard session.
+     */
+    private final Map<String, PhoneCameraControls> phoneControlsByCameraId = new HashMap<>();
     private final StyledButton addCameraButton = new StyledButton("Add camera", FontAwesomeSolid.PLUS, BlueTheme.PRIMARY);
     private final StyledButton removeCameraButton = new StyledButton("Remove selected", FontAwesomeSolid.MINUS, BlueTheme.DEEP_BLUE);
     private final StyledButton saveButton = new StyledButton("Save camera changes", FontAwesomeSolid.CHECK, BlueTheme.PRIMARY);
 
     private Consumer<EngineSettings> saveAction = ignored -> { };
+    private Function<AndroidIpCameraRequest, CompletableFuture<String>> adbForwardAction = ignored ->
+            CompletableFuture.failedFuture(new IllegalStateException(
+                    "Camera controls are still starting. Please try again in a moment."));
+    private Function<IpCameraZoomRequest, CompletableFuture<String>> zoomAction = ignored ->
+            CompletableFuture.failedFuture(new IllegalStateException(
+                    "Camera controls are still starting. Please try again in a moment."));
     private EngineSettings currentSettings = EngineSettings.defaults();
 
     CameraManagementPanel() {
@@ -68,6 +89,14 @@ final class CameraManagementPanel extends JPanel {
 
     void setSaveAction(Consumer<EngineSettings> saveAction) {
         this.saveAction = saveAction;
+    }
+
+    /** Installs controller-owned background actions for optional Android IP Camera controls. */
+    void setPhoneCameraActions(
+            Function<AndroidIpCameraRequest, CompletableFuture<String>> adbForwardAction,
+            Function<IpCameraZoomRequest, CompletableFuture<String>> zoomAction) {
+        this.adbForwardAction = adbForwardAction == null ? this.adbForwardAction : adbForwardAction;
+        this.zoomAction = zoomAction == null ? this.zoomAction : zoomAction;
     }
 
     void showSettings(EngineSettings settings) {
@@ -129,6 +158,7 @@ final class CameraManagementPanel extends JPanel {
             throw new IllegalArgumentException("Configure at least one camera before saving.");
         }
         List<CameraSettings> cameras = new ArrayList<>();
+        validateDistinctAdbPorts();
         for (CameraSetupPanel editor : cameraEditors) {
             CameraSettings camera = editor.toCameraSettings();
             if (cameras.stream().anyMatch(existing -> existing.cameraId().equalsIgnoreCase(camera.cameraId()))) {
@@ -139,6 +169,11 @@ final class CameraManagementPanel extends JPanel {
         CameraSettings primary = cameras.stream().filter(CameraSettings::enabled).findFirst().orElse(cameras.get(0));
         return new EngineSettings(
                 currentSettings.confidenceThreshold(),
+                currentSettings.gestureSensitivity(),
+                currentSettings.thumbTuckConfidenceBonus(),
+                currentSettings.indexFoldConfidenceBonus(),
+                currentSettings.repeatedHandsignMinConfidence(),
+                currentSettings.repeatedHandsignConfidenceTarget(),
                 currentSettings.preEventSeconds(),
                 currentSettings.postEventSeconds(),
                 currentSettings.requireThumb(),
@@ -155,6 +190,8 @@ final class CameraManagementPanel extends JPanel {
     }
 
     private void replaceCameraEditors(List<CameraSettings> cameras) {
+        String selectedCameraId = selectedCameraIdKey();
+        retainPhoneControls();
         cameraEditors.clear();
         cameraTabs.removeAll();
         List<CameraSettings> visibleCameras = cameras == null || cameras.isEmpty()
@@ -162,9 +199,31 @@ final class CameraManagementPanel extends JPanel {
                 : cameras;
         visibleCameras.stream().limit(MAX_CAMERAS).forEach(camera -> addCameraEditor(camera, false));
         if (cameraTabs.getTabCount() > 0) {
-            cameraTabs.setSelectedIndex(0);
+            int selectedIndex = indexForCameraId(selectedCameraId);
+            cameraTabs.setSelectedIndex(selectedIndex < 0 ? 0 : selectedIndex);
         }
         updateCameraButtons();
+    }
+
+    /** Keep an operator on the same camera after Save & Apply rebuilds the forms. */
+    private String selectedCameraIdKey() {
+        int selectedIndex = cameraTabs.getSelectedIndex();
+        if (selectedIndex < 0 || selectedIndex >= cameraEditors.size()) {
+            return "";
+        }
+        return cameraEditors.get(selectedIndex).cameraIdForKey();
+    }
+
+    private int indexForCameraId(String cameraId) {
+        if (cameraId == null || cameraId.isBlank()) {
+            return -1;
+        }
+        for (int index = 0; index < cameraEditors.size(); index++) {
+            if (cameraId.equals(cameraEditors.get(index).cameraIdForKey())) {
+                return index;
+            }
+        }
+        return -1;
     }
 
     private void addCameraEditor(CameraSettings camera, boolean selectNewCamera) {
@@ -176,7 +235,12 @@ final class CameraManagementPanel extends JPanel {
                     JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        CameraSetupPanel editor = new CameraSetupPanel(camera, this::refreshCameraTabTitles);
+        CameraSetupPanel editor = new CameraSetupPanel(
+                camera,
+                phoneControlsFor(camera, cameraEditors.size()),
+                this::refreshCameraTabTitles,
+                request -> adbForwardAction.apply(request),
+                request -> zoomAction.apply(request));
         cameraEditors.add(editor);
         JScrollPane editorScroll = new JScrollPane(editor);
         editorScroll.setBorder(BorderFactory.createEmptyBorder());
@@ -187,6 +251,37 @@ final class CameraManagementPanel extends JPanel {
             cameraTabs.setSelectedIndex(cameraTabs.getTabCount() - 1);
         }
         updateCameraButtons();
+    }
+
+    private void retainPhoneControls() {
+        for (CameraSetupPanel editor : cameraEditors) {
+            phoneControlsByCameraId.put(editor.cameraIdForKey(), editor.phoneControls());
+        }
+    }
+
+    private PhoneCameraControls phoneControlsFor(CameraSettings camera, int zeroBasedCameraIndex) {
+        PhoneCameraControls saved = phoneControlsByCameraId.get(cameraIdKey(camera.cameraId()));
+        return saved == null ? PhoneCameraControls.defaultsFor(zeroBasedCameraIndex) : saved;
+    }
+
+    private void validateDistinctAdbPorts() {
+        Map<Integer, String> ownerByPort = new HashMap<>();
+        for (CameraSetupPanel editor : cameraEditors) {
+            if (!editor.hasAdbConnection()) {
+                continue;
+            }
+            int port = editor.laptopPortForValidation();
+            String previousOwner = ownerByPort.putIfAbsent(port, editor.cameraIdForDisplay());
+            if (previousOwner != null) {
+                throw new IllegalArgumentException("Laptop listening port " + port + " is configured for both "
+                        + previousOwner + " and " + editor.cameraIdForDisplay()
+                        + ". Use a different localhost port for each phone camera.");
+            }
+        }
+    }
+
+    private static String cameraIdKey(String cameraId) {
+        return (cameraId == null ? "" : cameraId.trim()).toUpperCase(Locale.ROOT);
     }
 
     private void removeSelectedCamera() {
@@ -236,6 +331,19 @@ final class CameraManagementPanel extends JPanel {
                 type, type.aspectWidth(), type.aspectHeight());
     }
 
+    private record PhoneCameraControls(String adbConnection, String laptopPort, String phonePort, String zoom) {
+        static PhoneCameraControls defaultsFor(int zeroBasedCameraIndex) {
+            return new PhoneCameraControls("", String.valueOf(17_170 + zeroBasedCameraIndex), "4444", "1.0");
+        }
+
+        PhoneCameraControls {
+            adbConnection = adbConnection == null ? "" : adbConnection;
+            laptopPort = laptopPort == null || laptopPort.isBlank() ? "17170" : laptopPort;
+            phonePort = phonePort == null || phonePort.isBlank() ? "4444" : phonePort;
+            zoom = zoom == null || zoom.isBlank() ? "1.0" : zoom;
+        }
+    }
+
     /** Independent and deliberately explicit form rows avoid shared GridBag state/overlap. */
     private static final class CameraSetupPanel extends JPanel {
         private final JCheckBox enabled = check("Enable ingestion for this camera");
@@ -247,18 +355,38 @@ final class CameraManagementPanel extends JPanel {
         private final JTextField aspectWidth = new JTextField(5);
         private final JTextField aspectHeight = new JTextField(5);
         private final JLabel profileHint = new JLabel();
-        private final JComboBox<ResolutionPreset> captureResolution = new JComboBox<>(ResolutionPreset.captureChoices());
+        private final JComboBox<ResolutionPreset> captureResolution = new JComboBox<>();
         private final JComboBox<ScalePreset> processingScale = new JComboBox<>(ScalePreset.values());
-        private final JComboBox<ResolutionPreset> previewResolution = new JComboBox<>(ResolutionPreset.previewChoices());
+        private final JComboBox<ResolutionPreset> previewResolution = new JComboBox<>();
+        private final JTextField adbConnection = new JTextField(22);
+        private final JTextField laptopPort = new JTextField("17170", 5);
+        private final JTextField phonePort = new JTextField("4444", 5);
+        private final JTextField zoom = new JTextField("1.0", 5);
+        private final StyledButton connectAndForward = new StyledButton(
+                "Connect & forward", FontAwesomeSolid.LINK, BlueTheme.PRIMARY);
+        private final StyledButton useForwardedStream = new StyledButton(
+                "Use forwarded stream", FontAwesomeSolid.CAMERA, BlueTheme.DEEP_BLUE);
+        private final StyledButton applyZoom = new StyledButton(
+                "Apply zoom", FontAwesomeSolid.SEARCH, BlueTheme.DEEP_BLUE);
+        private final JLabel phoneStatus = new JLabel("Optional: connect Android IP Camera through ADB, then save this camera.");
         private final Runnable onChanged;
+        private final Function<AndroidIpCameraRequest, CompletableFuture<String>> adbForwardAction;
+        private final Function<IpCameraZoomRequest, CompletableFuture<String>> zoomAction;
         private boolean applyingProfile;
 
-        CameraSetupPanel(CameraSettings camera, Runnable onChanged) {
+        CameraSetupPanel(
+                CameraSettings camera,
+                PhoneCameraControls phoneControls,
+                Runnable onChanged,
+                Function<AndroidIpCameraRequest, CompletableFuture<String>> adbForwardAction,
+                Function<IpCameraZoomRequest, CompletableFuture<String>> zoomAction) {
             super(new BorderLayout());
             this.onChanged = onChanged;
+            this.adbForwardAction = adbForwardAction;
+            this.zoomAction = zoomAction;
             setBackground(BlueTheme.BACKGROUND);
             setBorder(BorderFactory.createEmptyBorder(16, 16, 16, 16));
-            setPreferredSize(new Dimension(760, 580));
+            setPreferredSize(new Dimension(760, 760));
 
             RoundedPanel card = new RoundedPanel(18);
             card.setLayout(new GridBagLayout());
@@ -273,9 +401,14 @@ final class CameraManagementPanel extends JPanel {
             cameraType.setSelectedItem(camera.cameraType());
             aspectWidth.setText(String.valueOf(camera.aspectWidth()));
             aspectHeight.setText(String.valueOf(camera.aspectHeight()));
-            chooseResolution(captureResolution, camera.captureWidth(), camera.captureHeight());
+            refreshResolutionChoices(
+                    new ResolutionPreset(camera.captureWidth(), camera.captureHeight()),
+                    new ResolutionPreset(camera.previewWidth(), camera.previewHeight()));
             processingScale.setSelectedItem(ScalePreset.nearest(camera.processingScale()));
-            chooseResolution(previewResolution, camera.previewWidth(), camera.previewHeight());
+            adbConnection.setText(phoneControls.adbConnection());
+            laptopPort.setText(phoneControls.laptopPort());
+            phonePort.setText(phoneControls.phonePort());
+            zoom.setText(phoneControls.zoom());
             captureResolution.setEditable(true);
             previewResolution.setEditable(true);
 
@@ -288,6 +421,10 @@ final class CameraManagementPanel extends JPanel {
             captureResolution.setToolTipText("Choose a size or type a custom value such as 1080 × 1920. Sources may keep their native image size.");
             processingScale.setToolTipText("Only the vision-analysis image is downscaled; stored video and the HUD stay sharp.");
             previewResolution.setToolTipText("Choose a size or type a custom value such as 540 × 960. HUD text is rendered separately at high resolution.");
+            adbConnection.setToolTipText("A wireless ADB target such as 192.168.68.113:42573, or an already-connected USB serial.");
+            laptopPort.setToolTipText("The localhost port the dashboard will expose, for example 17170.");
+            phonePort.setToolTipText("Android IP Camera's port on the phone, normally 4444.");
+            zoom.setToolTipText("Android IP Camera optical/digital zoom request, from 1.0× to 20.0× if the phone lens supports it.");
 
             int row = 0;
             addSection(card, row++, "Camera identity & source", FontAwesomeSolid.CAMERA);
@@ -304,6 +441,17 @@ final class CameraManagementPanel extends JPanel {
             addField(card, row++, "Capture resolution", captureResolution);
             addField(card, row++, "Vision processing scale", processingScale);
             addField(card, row++, "Video downscale / dashboard preview", previewResolution);
+
+            addSection(card, row++, "Android IP Camera controls (optional)", FontAwesomeSolid.MOBILE);
+            addField(card, row++, "ADB connection", adbConnection);
+            addField(card, row++, "Laptop listening port", laptopPort);
+            addField(card, row++, "Phone camera server port", phonePort);
+            addField(card, row++, "ADB tunnel", adbButtons());
+            addField(card, row++, "Zoom (1.0×–20.0×)", zoomButtons());
+            phoneStatus.setFont(BlueTheme.font(Font.PLAIN, 11));
+            phoneStatus.setForeground(BlueTheme.MUTED);
+            phoneStatus.setToolTipText("ADB connection, ports, and zoom stay available for this dashboard session but are not saved to the camera config.");
+            addFullWidth(card, row++, phoneStatus);
 
             JLabel guidance = new JLabel("<html><b>Source examples:</b> <code>0</code> = laptop webcam; "
                     + "<code>uvc://0</code> = actual Windows UVC/USB camera; "
@@ -330,7 +478,120 @@ final class CameraManagementPanel extends JPanel {
                 }
             });
             cameraId.getDocument().addDocumentListener(changeListener(this.onChanged));
+            DocumentListener customAspectChanged = changeListener(() -> {
+                if (!applyingProfile && selectedCameraType() == CameraSettings.CameraType.CUSTOM) {
+                    refreshResolutionChoices(currentResolution(captureResolution), currentResolution(previewResolution));
+                }
+                this.onChanged.run();
+            });
+            aspectWidth.getDocument().addDocumentListener(customAspectChanged);
+            aspectHeight.getDocument().addDocumentListener(customAspectChanged);
             updateProfileControls();
+        }
+
+        private JPanel adbButtons() {
+            JPanel buttons = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0));
+            buttons.setOpaque(false);
+            buttons.add(connectAndForward);
+            buttons.add(useForwardedStream);
+            connectAndForward.addActionListener(event -> forwardAndroidIpCamera());
+            useForwardedStream.addActionListener(event -> selectForwardedStream());
+            return buttons;
+        }
+
+        private JPanel zoomButtons() {
+            JPanel controls = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0));
+            controls.setOpaque(false);
+            controls.add(zoom);
+            controls.add(applyZoom);
+            applyZoom.addActionListener(event -> applyAndroidIpCameraZoom());
+            return controls;
+        }
+
+        private void forwardAndroidIpCamera() {
+            try {
+                AndroidIpCameraRequest request = new AndroidIpCameraRequest(
+                        adbConnection.getText(), parsePort(laptopPort.getText(), "Laptop listening port"),
+                        parsePort(phonePort.getText(), "Phone camera server port"));
+                phoneStatus.setText("Connecting Android device and creating the ADB forward…");
+                phoneStatus.setForeground(BlueTheme.INFO);
+                observePhoneControl(adbForwardAction.apply(request));
+            } catch (IllegalArgumentException | IllegalStateException invalid) {
+                phoneStatus.setText(invalid.getMessage());
+                phoneStatus.setForeground(BlueTheme.DANGER);
+            }
+        }
+
+        private void selectForwardedStream() {
+            try {
+                int port = parsePort(laptopPort.getText(), "Laptop listening port");
+                source.setText("http://127.0.0.1:" + port + "/video/mjpeg");
+                phoneStatus.setText("Forwarded stream selected. Save camera changes to send it to the engine.");
+                phoneStatus.setForeground(BlueTheme.SUCCESS);
+                onChanged.run();
+            } catch (IllegalArgumentException invalid) {
+                phoneStatus.setText(invalid.getMessage());
+                phoneStatus.setForeground(BlueTheme.DANGER);
+            }
+        }
+
+        private void applyAndroidIpCameraZoom() {
+            if (selectedCameraType() == CameraSettings.CameraType.LAPTOP_WEBCAM) {
+                phoneStatus.setText("Zoom is unavailable for a laptop webcam. Use the Windows Camera controls instead.");
+                phoneStatus.setForeground(BlueTheme.MUTED);
+                return;
+            }
+            try {
+                double requestedZoom = Double.parseDouble(zoom.getText().trim());
+                IpCameraZoomRequest request = new IpCameraZoomRequest(source.getText(), requestedZoom);
+                phoneStatus.setText("Sending zoom request to Android IP Camera…");
+                phoneStatus.setForeground(BlueTheme.INFO);
+                observePhoneControl(zoomAction.apply(request));
+            } catch (NumberFormatException invalid) {
+                phoneStatus.setText("Zoom must be a number between 1.0× and 20.0×.");
+                phoneStatus.setForeground(BlueTheme.DANGER);
+            } catch (IllegalArgumentException | IllegalStateException invalid) {
+                phoneStatus.setText(invalid.getMessage());
+                phoneStatus.setForeground(BlueTheme.DANGER);
+            }
+        }
+
+        private static int parsePort(String value, String label) {
+            try {
+                int parsed = Integer.parseInt(value.trim());
+                if (parsed < 1 || parsed > 65_535) {
+                    throw new NumberFormatException();
+                }
+                return parsed;
+            } catch (RuntimeException invalid) {
+                throw new IllegalArgumentException(label + " must be a whole number between 1 and 65535.");
+            }
+        }
+
+        private void observePhoneControl(CompletableFuture<String> action) {
+            if (action == null) {
+                phoneStatus.setText("Camera control could not be started. Please try again.");
+                phoneStatus.setForeground(BlueTheme.DANGER);
+                return;
+            }
+            action.whenComplete((message, failure) -> SwingUtilities.invokeLater(() -> {
+                if (failure == null) {
+                    phoneStatus.setText(message == null || message.isBlank()
+                            ? "Camera control completed."
+                            : message);
+                    phoneStatus.setForeground(BlueTheme.SUCCESS);
+                    return;
+                }
+                Throwable cause = failure;
+                while (cause.getCause() != null) {
+                    cause = cause.getCause();
+                }
+                String detail = cause.getMessage();
+                phoneStatus.setText(detail == null || detail.isBlank()
+                        ? "Camera control failed. Check the dashboard message and retry."
+                        : detail);
+                phoneStatus.setForeground(BlueTheme.DANGER);
+            }));
         }
 
         CameraSettings toCameraSettings() {
@@ -363,6 +624,23 @@ final class CameraManagementPanel extends JPanel {
             return value.isEmpty() ? "Unnamed" : value;
         }
 
+        String cameraIdForKey() {
+            return cameraIdKey(cameraId.getText());
+        }
+
+        PhoneCameraControls phoneControls() {
+            return new PhoneCameraControls(
+                    adbConnection.getText(), laptopPort.getText(), phonePort.getText(), zoom.getText());
+        }
+
+        boolean hasAdbConnection() {
+            return !adbConnection.getText().trim().isEmpty();
+        }
+
+        int laptopPortForValidation() {
+            return parsePort(laptopPort.getText(), "Laptop listening port");
+        }
+
         private void updateEnabledStatus() {
             boolean active = enabled.isSelected();
             status.setText(active
@@ -391,10 +669,11 @@ final class CameraManagementPanel extends JPanel {
             CameraSettings.CameraType type = selectedCameraType();
             applyingProfile = true;
             try {
-                chooseResolution(captureResolution, type.captureWidth(), type.captureHeight());
-                chooseResolution(previewResolution, type.previewWidth(), type.previewHeight());
                 aspectWidth.setText(String.valueOf(type.aspectWidth()));
                 aspectHeight.setText(String.valueOf(type.aspectHeight()));
+                refreshResolutionChoices(
+                        new ResolutionPreset(type.captureWidth(), type.captureHeight()),
+                        new ResolutionPreset(type.previewWidth(), type.previewHeight()));
             } finally {
                 applyingProfile = false;
             }
@@ -410,6 +689,89 @@ final class CameraManagementPanel extends JPanel {
             profileHint.setText(custom
                     ? "Custom profile — enter the source's intended aspect above. The engine preserves the actual frame aspect when it opens."
                     : "Profile default: " + ratio + ". The engine reports the actual opened frame dimensions and preserves them without stretching.");
+            updateZoomAvailability(type);
+        }
+
+        /** Rebuild presets whenever an orientation/profile changes, hiding irrelevant aspect choices. */
+        private void refreshResolutionChoices(
+                ResolutionPreset requestedCapture, ResolutionPreset requestedPreview) {
+            CameraSettings.CameraType type = selectedCameraType();
+            boolean portrait = usesPortraitChoices(type);
+            ResolutionPreset captureFallback = ResolutionPreset.defaultCapture(portrait);
+            ResolutionPreset previewFallback = ResolutionPreset.defaultPreview(portrait);
+            replaceResolutionChoices(
+                    captureResolution,
+                    ResolutionPreset.captureChoices(portrait),
+                    requestedCapture,
+                    captureFallback,
+                    portrait);
+            replaceResolutionChoices(
+                    previewResolution,
+                    ResolutionPreset.previewChoices(portrait),
+                    requestedPreview,
+                    previewFallback,
+                    portrait);
+        }
+
+        private boolean usesPortraitChoices(CameraSettings.CameraType type) {
+            if (type != CameraSettings.CameraType.CUSTOM) {
+                return type.aspectHeight() > type.aspectWidth();
+            }
+            int width = optionalAspectPart(aspectWidth.getText(), type.aspectWidth());
+            int height = optionalAspectPart(aspectHeight.getText(), type.aspectHeight());
+            return height > width;
+        }
+
+        private static int optionalAspectPart(String value, int fallback) {
+            try {
+                int parsed = Integer.parseInt(value == null ? "" : value.trim());
+                return parsed >= 1 && parsed <= 10_000 ? parsed : fallback;
+            } catch (RuntimeException ignored) {
+                return fallback;
+            }
+        }
+
+        private static void replaceResolutionChoices(
+                JComboBox<ResolutionPreset> combo,
+                ResolutionPreset[] options,
+                ResolutionPreset requested,
+                ResolutionPreset fallback,
+                boolean portrait) {
+            combo.removeAllItems();
+            for (ResolutionPreset option : options) {
+                combo.addItem(option);
+            }
+            ResolutionPreset selected = requested != null && requested.matchesOrientation(portrait)
+                    ? requested
+                    : fallback;
+            chooseResolution(combo, selected.width(), selected.height());
+        }
+
+        private static ResolutionPreset currentResolution(JComboBox<ResolutionPreset> combo) {
+            Object candidate = combo.isEditable() ? combo.getEditor().getItem() : combo.getSelectedItem();
+            if (candidate instanceof ResolutionPreset preset) {
+                return preset;
+            }
+            return ResolutionPreset.parse(candidate == null ? null : candidate.toString());
+        }
+
+        private void updateZoomAvailability(CameraSettings.CameraType type) {
+            boolean laptopWebcam = type == CameraSettings.CameraType.LAPTOP_WEBCAM;
+            zoom.setEnabled(!laptopWebcam);
+            applyZoom.setEnabled(!laptopWebcam);
+            if (laptopWebcam) {
+                zoom.setToolTipText("Zoom is not available for a Windows laptop webcam. Use the camera app or choose a supported IP camera.");
+                applyZoom.setToolTipText("Zoom is unavailable because this camera uses the Laptop webcam profile.");
+                phoneStatus.setText("Zoom is unavailable for a laptop webcam. Use the Windows Camera controls, or choose a phone/IP-camera profile with remote zoom support.");
+                phoneStatus.setForeground(BlueTheme.MUTED);
+            } else {
+                zoom.setToolTipText("Android IP Camera optical/digital zoom request, from 1.0× to 20.0× if the phone lens supports it.");
+                applyZoom.setToolTipText("Send a remote zoom request to a supported Android IP Camera source.");
+                if (phoneStatus.getText().startsWith("Zoom is unavailable for a laptop webcam")) {
+                    phoneStatus.setText("Optional: connect Android IP Camera through ADB, then save this camera.");
+                    phoneStatus.setForeground(BlueTheme.MUTED);
+                }
+            }
         }
 
         private static int positiveAspectPart(String value, String label) {
@@ -538,28 +900,53 @@ final class CameraManagementPanel extends JPanel {
     }
 
     private record ResolutionPreset(int width, int height) {
-        static ResolutionPreset[] captureChoices() {
-            return new ResolutionPreset[] {
+        static ResolutionPreset[] captureChoices(boolean portrait) {
+            if (portrait) {
+                return new ResolutionPreset[] {
                     new ResolutionPreset(1080, 1920),
                     new ResolutionPreset(720, 1280),
-                    new ResolutionPreset(1920, 1080),
-                    new ResolutionPreset(1280, 720),
-                    new ResolutionPreset(960, 540),
-                    new ResolutionPreset(640, 480),
-                    new ResolutionPreset(480, 360)
-            };
-        }
-
-        static ResolutionPreset[] previewChoices() {
-            return new ResolutionPreset[] {
                     new ResolutionPreset(540, 960),
-                    new ResolutionPreset(360, 640),
+                    new ResolutionPreset(360, 640)
+                };
+            }
+            return new ResolutionPreset[] {
+                    new ResolutionPreset(1920, 1080),
                     new ResolutionPreset(1280, 720),
                     new ResolutionPreset(960, 540),
                     new ResolutionPreset(854, 480),
                     new ResolutionPreset(640, 360),
-                    new ResolutionPreset(480, 360)
+                    new ResolutionPreset(480, 270)
             };
+        }
+
+        static ResolutionPreset[] previewChoices(boolean portrait) {
+            if (portrait) {
+                return new ResolutionPreset[] {
+                    new ResolutionPreset(540, 960),
+                    new ResolutionPreset(360, 640),
+                    new ResolutionPreset(270, 480),
+                    new ResolutionPreset(180, 320)
+                };
+            }
+            return new ResolutionPreset[] {
+                    new ResolutionPreset(1280, 720),
+                    new ResolutionPreset(960, 540),
+                    new ResolutionPreset(854, 480),
+                    new ResolutionPreset(640, 360),
+                    new ResolutionPreset(480, 270)
+            };
+        }
+
+        static ResolutionPreset defaultCapture(boolean portrait) {
+            return portrait ? new ResolutionPreset(1080, 1920) : new ResolutionPreset(1280, 720);
+        }
+
+        static ResolutionPreset defaultPreview(boolean portrait) {
+            return portrait ? new ResolutionPreset(540, 960) : new ResolutionPreset(960, 540);
+        }
+
+        boolean matchesOrientation(boolean portrait) {
+            return portrait ? height > width : width >= height;
         }
 
         @Override

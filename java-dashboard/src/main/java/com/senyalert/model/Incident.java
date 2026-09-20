@@ -10,6 +10,7 @@ public record Incident(
         long eventTimestampEpochSeconds,
         double confidence,
         String triageContext,
+        String incidentType,
         AlertMode alertMode,
         IncidentStatus status,
         String operatorNotes,

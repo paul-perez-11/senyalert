@@ -27,7 +27,7 @@ import java.util.concurrent.CompletableFuture;
 public final class SqliteIncidentRepository implements IncidentRepository {
     private static final String SUMMARY_COLUMNS = """
             incident_id, event_token, camera_id, location, detection_timestamp, event_timestamp_epoch,
-            confidence, triage_level, alert_mode, status, operator_notes, people_count, people_count_stale,
+            confidence, triage_level, incident_type, alert_mode, status, operator_notes, people_count, people_count_stale,
             occupancy_status, hand_count, signaler_count, signaler_track_id, signaler_bounds, snapshot_path,
             video_path, media_ready, media_status, video_duration_sec
             """;
@@ -58,11 +58,11 @@ public final class SqliteIncidentRepository implements IncidentRepository {
             String insert = """
                     INSERT INTO incident_logs (
                         event_token, camera_id, location, detection_timestamp, event_timestamp_epoch,
-                        confidence, triage_level, alert_mode, status, people_count, people_count_stale,
+                        confidence, triage_level, incident_type, alert_mode, status, people_count, people_count_stale,
                         occupancy_status, hand_count, signaler_count, signaler_track_id, signaler_bounds,
                         snapshot_path, snapshot_blob, snapshot_mime_type, media_ready, media_status
                     ) VALUES (
-                        ?, ?, ?, datetime(?, 'unixepoch', 'localtime'), ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, datetime(?, 'unixepoch', 'localtime'), ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, 0, 'PENDING'
                     )
                     """;
@@ -75,18 +75,20 @@ public final class SqliteIncidentRepository implements IncidentRepository {
                 statement.setLong(5, event.timestampEpochSeconds());
                 statement.setDouble(6, event.confidence());
                 statement.setString(7, event.triageContext());
-                statement.setString(8, alertMode.name());
-                statement.setString(9, IncidentStatus.PENDING.name());
-                statement.setInt(10, Math.max(0, event.peopleCount()));
-                statement.setInt(11, event.peopleCountStale() ? 1 : 0);
-                statement.setString(12, event.occupancyStatus());
-                statement.setInt(13, Math.max(0, event.handCount()));
-                statement.setInt(14, Math.max(0, event.signalerCount()));
-                statement.setString(15, event.signalerTrackId());
-                statement.setString(16, event.signalerBounds());
-                statement.setString(17, emptyToNull(event.snapshotPath()));
-                statement.setBytes(18, snapshot);
-                statement.setString(19, event.snapshotMimeType());
+                statement.setString(8, event.incidentType() == null || event.incidentType().isBlank()
+                        ? "SOS handsign" : event.incidentType());
+                statement.setString(9, alertMode.name());
+                statement.setString(10, IncidentStatus.PENDING.name());
+                statement.setInt(11, Math.max(0, event.peopleCount()));
+                statement.setInt(12, event.peopleCountStale() ? 1 : 0);
+                statement.setString(13, event.occupancyStatus());
+                statement.setInt(14, Math.max(0, event.handCount()));
+                statement.setInt(15, Math.max(0, event.signalerCount()));
+                statement.setString(16, event.signalerTrackId());
+                statement.setString(17, event.signalerBounds());
+                statement.setString(18, emptyToNull(event.snapshotPath()));
+                statement.setBytes(19, snapshot);
+                statement.setString(20, event.snapshotMimeType());
                 statement.executeUpdate();
 
                 try (ResultSet keys = statement.getGeneratedKeys()) {
@@ -267,6 +269,7 @@ public final class SqliteIncidentRepository implements IncidentRepository {
                 row.getLong("event_timestamp_epoch"),
                 row.getDouble("confidence"),
                 nullToEmpty(row.getString("triage_level")),
+                nullToEmpty(row.getString("incident_type")),
                 AlertMode.fromDatabase(row.getString("alert_mode")),
                 IncidentStatus.fromDatabase(row.getString("status")),
                 nullToEmpty(row.getString("operator_notes")),

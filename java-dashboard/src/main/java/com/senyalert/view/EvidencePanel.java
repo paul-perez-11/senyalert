@@ -3,6 +3,7 @@ package com.senyalert.view;
 import com.senyalert.model.Incident;
 import com.senyalert.model.IncidentEvidence;
 import com.senyalert.model.IncidentStatus;
+import com.senyalert.model.MediaDeletionOptions;
 import com.senyalert.model.OperatorIncidentUpdate;
 import com.senyalert.view.ui.BlueTheme;
 import com.senyalert.view.ui.RoundedPanel;
@@ -46,7 +47,7 @@ final class EvidencePanel extends RoundedPanel {
     private IncidentEvidence currentEvidence;
 
     private BiConsumer<Long, OperatorIncidentUpdate> operatorUpdateAction = (ignored, update) -> { };
-    private LongConsumer deleteAction = ignored -> { };
+    private BiConsumer<Long, MediaDeletionOptions> deleteAction = (ignored, options) -> { };
     private LongConsumer playAction = ignored -> { };
     private BiConsumer<Long, Path> exportAction = (ignored, path) -> { };
 
@@ -118,7 +119,7 @@ final class EvidencePanel extends RoundedPanel {
 
     void setActions(
             BiConsumer<Long, OperatorIncidentUpdate> operatorUpdateAction,
-            LongConsumer deleteAction,
+            BiConsumer<Long, MediaDeletionOptions> deleteAction,
             LongConsumer playAction,
             BiConsumer<Long, Path> exportAction) {
         this.operatorUpdateAction = operatorUpdateAction;
@@ -239,16 +240,18 @@ final class EvidencePanel extends RoundedPanel {
             return;
         }
         long incidentId = currentEvidence.incident().id();
-        int choice = JOptionPane.showConfirmDialog(
-                this,
-                "Delete incident #" + incidentId + " from the dashboard database?\n"
-                        + "This removes its SQLite record and stored BLOBs only.\n"
-                        + "It does not delete any source snapshot or video files.",
-                "Delete database record",
-                JOptionPane.YES_NO_OPTION,
-                JOptionPane.WARNING_MESSAGE);
-        if (choice == JOptionPane.YES_OPTION) {
-            deleteAction.accept(incidentId);
+        javax.swing.JCheckBox deleteSnapshot = new javax.swing.JCheckBox("Delete the associated image snapshot");
+        javax.swing.JCheckBox deleteVideo = new javax.swing.JCheckBox("Delete the associated video clip");
+        JPanel confirmation = new JPanel(new java.awt.GridLayout(0, 1, 0, 4));
+        confirmation.add(new JLabel("Delete incident #" + incidentId + " from the dashboard database?"));
+        confirmation.add(new JLabel("Optional source-media cleanup (unchecked files remain on disk):"));
+        confirmation.add(deleteSnapshot);
+        confirmation.add(deleteVideo);
+        int choice = JOptionPane.showConfirmDialog(this, confirmation, "Delete database record",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (choice == JOptionPane.OK_OPTION) {
+            deleteAction.accept(incidentId,
+                    new MediaDeletionOptions(deleteSnapshot.isSelected(), deleteVideo.isSelected()));
         }
     }
 
@@ -277,6 +280,7 @@ final class EvidencePanel extends RoundedPanel {
         return "Camera: " + incident.cameraId() + "\n"
                 + "Location: " + incident.location() + "\n"
                 + "Detected: " + incident.detectionTimestamp() + "\n"
+                + "Incident type: " + (incident.incidentType().isBlank() ? "SOS handsign" : incident.incidentType()) + "\n"
                 + "Confidence: " + String.format("%.1f%%", incident.confidence() * 100) + "\n"
                 + "Alert policy: " + incident.alertMode().displayName() + "\n"
                 + "People / hands / SOS signalers: " + incident.peopleCount() + " / " + incident.handCount()

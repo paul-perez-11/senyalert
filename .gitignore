@@ -1,22 +1,24 @@
-# Ignore java class files
+# Java build output
 *.class
+/java-dashboard/target/
 
-# Ignore Video Files
-*.mp4
-*.mov
-*.avi
-*.mkv
+# Generated local evidence (new and legacy locations)
+/evidence/
+/snapshots/
+/src/snapshots/
+/incident_*.mp4
+/src/incident_*.mp4
 
-# Ignore Image Files
-*.jpg
-*.jpeg
-*.png
-*.gif
-*.webp
+# Generated benchmark reports and measurements
+/benchmark-results/
 
-# Ignore database (so our photos aren't on the internet)
-/java-dashboard/incidents.db 
+# Local database state, playback caches, and per-machine camera settings
+/java-dashboard/incidents.db*
+/java-dashboard/uploaded-incidents.db*
+/java-dashboard/evidence-cache/
+/java-dashboard/uploaded-evidence-cache/
+/java-dashboard/senyalert-config.json
 
-# 2. Unignore the allowed folder structure so Git can read into it
-!assets/
-!assets/**
+# Python bytecode caches
+__pycache__/
+*.py[cod]

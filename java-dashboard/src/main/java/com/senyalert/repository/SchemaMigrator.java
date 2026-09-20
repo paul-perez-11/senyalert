@@ -29,6 +29,7 @@ final class SchemaMigrator {
                         detection_timestamp TEXT DEFAULT (datetime('now', 'localtime')),
                         confidence REAL NOT NULL,
                         triage_level TEXT NOT NULL,
+                        incident_type TEXT DEFAULT 'SOS handsign',
                         status TEXT DEFAULT 'PENDING',
                         operator_notes TEXT,
                         event_token TEXT,
@@ -56,6 +57,7 @@ final class SchemaMigrator {
 
             Set<String> columns = incidentColumns(connection);
             addColumnIfMissing(statement, columns, "status", "TEXT DEFAULT 'PENDING'");
+            addColumnIfMissing(statement, columns, "incident_type", "TEXT DEFAULT 'SOS handsign'");
             addColumnIfMissing(statement, columns, "operator_notes", "TEXT");
             addColumnIfMissing(statement, columns, "event_token", "TEXT");
             addColumnIfMissing(statement, columns, "location", "TEXT DEFAULT 'Unassigned Zone'");

@@ -4,6 +4,7 @@ import com.senyalert.model.ArchiveExportMode;
 import com.senyalert.model.Incident;
 import com.senyalert.model.IncidentEvidence;
 import com.senyalert.model.IncidentStatus;
+import com.senyalert.model.MediaDeletionOptions;
 import com.senyalert.model.OperatorIncidentUpdate;
 import com.senyalert.view.ui.BlueTheme;
 import com.senyalert.view.ui.StyledButton;
@@ -26,6 +27,7 @@ import javax.swing.JButton;
 import javax.swing.JComboBox;
 import javax.swing.JDialog;
 import javax.swing.JFileChooser;
+import javax.swing.JCheckBox;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
@@ -44,6 +46,11 @@ final class IncidentViewerDialog extends JDialog {
         void export(long incidentId, Path destinationDirectory, ArchiveExportMode mode);
     }
 
+    @FunctionalInterface
+    interface DeleteAction {
+        void delete(long incidentId, MediaDeletionOptions options);
+    }
+
     private final JLabel title = new JLabel("Incident evidence");
     private final JTextArea recordDetails = readOnlyArea();
     private final JComboBox<IncidentStatus> status = new JComboBox<>(IncidentStatus.values());
@@ -54,14 +61,14 @@ final class IncidentViewerDialog extends JDialog {
     private final JButton resolve = new StyledButton("Resolve", FontAwesomeSolid.CHECK, BlueTheme.SUCCESS);
     private final JButton save = new StyledButton("Save operator update", FontAwesomeSolid.CHECK, BlueTheme.DEEP_BLUE);
     private final JButton play = new StyledButton("Play natively", FontAwesomeSolid.PLAY, BlueTheme.DEEP_BLUE);
-    private final JButton exportRecord = new StyledButton("Export all…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
-    private final JButton exportMedia = new StyledButton("Export all…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
+    private final JButton exportRecord = new StyledButton("Export report + media…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
+    private final JButton exportMedia = new StyledButton("Export all media…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
     private final JButton deleteRecord = new StyledButton("Delete record…", FontAwesomeSolid.EXCLAMATION_TRIANGLE, BlueTheme.DANGER);
     private final JButton deleteRecordFromMedia = new StyledButton("Delete record…", FontAwesomeSolid.EXCLAMATION_TRIANGLE, BlueTheme.DANGER);
 
     private IncidentEvidence evidence;
     private BiConsumer<Long, OperatorIncidentUpdate> updateAction = (ignored, update) -> { };
-    private LongConsumer deleteAction = ignored -> { };
+    private DeleteAction deleteAction = (ignored, options) -> { };
     private LongConsumer playAction = ignored -> { };
     private ExportAction exportAction = (ignored, directory, mode) -> { };
 
@@ -98,7 +105,7 @@ final class IncidentViewerDialog extends JDialog {
 
     void setActions(
             BiConsumer<Long, OperatorIncidentUpdate> updateAction,
-            LongConsumer deleteAction,
+            DeleteAction deleteAction,
             LongConsumer playAction,
             ExportAction exportAction) {
         this.updateAction = updateAction;
@@ -282,15 +289,20 @@ final class IncidentViewerDialog extends JDialog {
             return;
         }
         long incidentId = evidence.incident().id();
-        int result = JOptionPane.showConfirmDialog(
-                this,
-                "Delete incident #" + incidentId + " from the evidence archive?\n\n"
-                        + "This removes only its SQLite row and stored BLOBs. It does not delete the source snapshot or video files.",
-                "Delete database record",
-                JOptionPane.YES_NO_OPTION,
-                JOptionPane.WARNING_MESSAGE);
-        if (result == JOptionPane.YES_OPTION) {
-            deleteAction.accept(incidentId);
+        JCheckBox deleteSnapshot = new JCheckBox("Delete the associated image snapshot");
+        JCheckBox deleteVideo = new JCheckBox("Delete the associated video clip");
+        JPanel content = transparentPanel(new BorderLayout(0, 8));
+        content.add(new JLabel("Delete incident #" + incidentId + " from the evidence archive?"), BorderLayout.NORTH);
+        JPanel mediaOptions = transparentPanel(new java.awt.GridLayout(0, 1, 0, 3));
+        mediaOptions.add(new JLabel("Optional source-media cleanup (unchecked files remain on disk):"));
+        mediaOptions.add(deleteSnapshot);
+        mediaOptions.add(deleteVideo);
+        content.add(mediaOptions, BorderLayout.CENTER);
+        int result = JOptionPane.showConfirmDialog(this, content, "Delete database record",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (result == JOptionPane.OK_OPTION) {
+            deleteAction.delete(incidentId,
+                    new MediaDeletionOptions(deleteSnapshot.isSelected(), deleteVideo.isSelected()));
         }
     }
 
@@ -339,6 +351,7 @@ final class IncidentViewerDialog extends JDialog {
         return "Camera: " + incident.cameraId() + "\n"
                 + "Location: " + incident.location() + "\n"
                 + "Detected: " + incident.detectionTimestamp() + "\n"
+                + "Incident type: " + display(incident.incidentType()) + "\n"
                 + "Confidence: " + String.format(java.util.Locale.ROOT, "%.1f%%", incident.confidence() * 100.0) + "\n"
                 + "Alert policy: " + incident.alertMode().displayName() + "\n"
                 + "People / hands / SOS signalers: " + incident.peopleCount() + " / " + incident.handCount()

@@ -29,6 +29,16 @@ import org.kordamp.ikonli.swing.FontIcon;
 final class SettingsPanel extends JPanel {
     private final JSlider confidence = new JSlider(50, 99, 70);
     private final JLabel confidenceValue = new JLabel();
+    private final JSlider gestureSensitivity = new JSlider(50, 150, 150);
+    private final JLabel gestureSensitivityValue = new JLabel();
+    private final JSlider thumbTuckBonus = new JSlider(0, 30, 10);
+    private final JLabel thumbTuckBonusValue = new JLabel();
+    private final JSlider indexFoldBonus = new JSlider(0, 30, 10);
+    private final JLabel indexFoldBonusValue = new JLabel();
+    private final JSlider repeatedHandsignMinimum = new JSlider(50, 95, 50);
+    private final JLabel repeatedHandsignMinimumValue = new JLabel();
+    private final JSlider repeatedHandsignTarget = new JSlider(50, 100, 75);
+    private final JLabel repeatedHandsignTargetValue = new JLabel();
     private final JSpinner preEvent = spinner(12, 1, 60);
     private final JSpinner postEvent = spinner(12, 1, 60);
     private final JCheckBox requireThumb = check("Require tucked thumb");
@@ -41,9 +51,11 @@ final class SettingsPanel extends JPanel {
     private final JCheckBox audibleEnabled = check("Allow audible alarms below the quiet threshold");
     private final StyledButton saveButton = new StyledButton("Save & Apply", FontAwesomeSolid.CHECK, BlueTheme.PRIMARY);
     private final StyledButton pauseButton = new StyledButton("Pause Engine", FontAwesomeSolid.PAUSE, BlueTheme.DEEP_BLUE);
+    private final StyledButton restartButton = new StyledButton("Restart Engine", FontAwesomeSolid.SYNC, BlueTheme.DEEP_BLUE);
 
     private Consumer<EngineSettings> saveAction = ignored -> { };
     private Runnable pauseAction = () -> { };
+    private Runnable restartAction = () -> { };
     private List<CameraSettings> configuredCameras = EngineSettings.defaults().cameras();
 
     SettingsPanel() {
@@ -90,8 +102,35 @@ final class SettingsPanel extends JPanel {
         confidence.setPaintTicks(true);
         confidence.setMajorTickSpacing(10);
         confidence.addChangeListener(event -> confidenceValue.setText(confidence.getValue() + "%"));
+        confidence.setToolTipText("Minimum measured gesture quality required before an incident can be created.");
+        gestureSensitivity.setPaintTicks(true);
+        gestureSensitivity.setMajorTickSpacing(25);
+        gestureSensitivity.setToolTipText(
+                "100% uses the calibrated gesture rule. 150% allows up to 50% more geometry tolerance; confidence remains a separate incident gate.");
+        gestureSensitivity.addChangeListener(event -> updateGestureSensitivityLabel());
+        thumbTuckBonus.setPaintTicks(true);
+        thumbTuckBonus.setMajorTickSpacing(10);
+        thumbTuckBonus.setToolTipText("Extra measured-confidence credit when a required thumb is visibly tucked.");
+        thumbTuckBonus.addChangeListener(event -> updateConfidenceTuningLabels());
+        indexFoldBonus.setPaintTicks(true);
+        indexFoldBonus.setMajorTickSpacing(10);
+        indexFoldBonus.setToolTipText("Extra measured-confidence credit when a required index finger is visibly folded.");
+        indexFoldBonus.addChangeListener(event -> updateConfidenceTuningLabels());
+        repeatedHandsignMinimum.setPaintTicks(true);
+        repeatedHandsignMinimum.setMajorTickSpacing(10);
+        repeatedHandsignMinimum.setToolTipText("Minimum raw confidence a repeated handsign must reach before it can escalate.");
+        repeatedHandsignMinimum.addChangeListener(event -> {
+            repeatedHandsignTarget.setMinimum(repeatedHandsignMinimum.getValue());
+            updateConfidenceTuningLabels();
+        });
+        repeatedHandsignTarget.setPaintTicks(true);
+        repeatedHandsignTarget.setMajorTickSpacing(10);
+        repeatedHandsignTarget.setToolTipText("Confidence target used by a qualified repeated-handsign escalation.");
+        repeatedHandsignTarget.addChangeListener(event -> updateConfidenceTuningLabels());
         quietThreshold.addChangeListener(event -> quietThresholdValue.setText(quietThreshold.getValue() + " people"));
         peopleEnabled.addActionListener(event -> updatePeopleControlState());
+        requireThumb.addActionListener(event -> updateFingerBonusControlState());
+        requireIndex.addActionListener(event -> updateFingerBonusControlState());
         saveButton.addActionListener(event -> {
             try {
                 saveAction.accept(readSettings());
@@ -104,16 +143,25 @@ final class SettingsPanel extends JPanel {
             }
         });
         pauseButton.addActionListener(event -> pauseAction.run());
+        restartButton.setToolTipText("Reconnect enabled camera workers without deleting evidence or changing saved settings.");
+        restartButton.addActionListener(event -> confirmEngineRestart());
         showSettings(EngineSettings.defaults());
     }
 
-    void setActions(Consumer<EngineSettings> saveAction, Runnable pauseAction) {
+    void setActions(Consumer<EngineSettings> saveAction, Runnable pauseAction, Runnable restartAction) {
         this.saveAction = saveAction;
         this.pauseAction = pauseAction;
+        this.restartAction = restartAction;
     }
 
     void showSettings(EngineSettings settings) {
         confidence.setValue((int) Math.round(settings.confidenceThreshold() * 100));
+        gestureSensitivity.setValue((int) Math.round(settings.gestureSensitivity() * 100));
+        thumbTuckBonus.setValue((int) Math.round(settings.thumbTuckConfidenceBonus() * 100));
+        indexFoldBonus.setValue((int) Math.round(settings.indexFoldConfidenceBonus() * 100));
+        repeatedHandsignMinimum.setValue((int) Math.round(settings.repeatedHandsignMinConfidence() * 100));
+        repeatedHandsignTarget.setMinimum(repeatedHandsignMinimum.getValue());
+        repeatedHandsignTarget.setValue((int) Math.round(settings.repeatedHandsignConfidenceTarget() * 100));
         preEvent.setValue(settings.preEventSeconds());
         postEvent.setValue(settings.postEventSeconds());
         requireThumb.setSelected(settings.requireThumb());
@@ -125,6 +173,9 @@ final class SettingsPanel extends JPanel {
         quietThreshold.setValue(settings.quietAtOrAbovePeople());
         audibleEnabled.setSelected(settings.audibleAlertsEnabled());
         confidenceValue.setText(confidence.getValue() + "%");
+        updateGestureSensitivityLabel();
+        updateConfidenceTuningLabels();
+        updateFingerBonusControlState();
         quietThresholdValue.setText(quietThreshold.getValue() + " people");
         updatePeopleControlState();
     }
@@ -157,6 +208,11 @@ final class SettingsPanel extends JPanel {
         GridBagConstraints constraints = constraints();
         addTitle(card, constraints, "Gesture detection", FontAwesomeSolid.HAND_PAPER);
         addRow(card, constraints, "Confidence threshold", sliderWithValue(confidence, confidenceValue));
+        addRow(card, constraints, "Gesture sensitivity", sliderWithValue(gestureSensitivity, gestureSensitivityValue));
+        addRow(card, constraints, "Tucked-thumb confidence bonus", sliderWithValue(thumbTuckBonus, thumbTuckBonusValue));
+        addRow(card, constraints, "Folded-index confidence bonus", sliderWithValue(indexFoldBonus, indexFoldBonusValue));
+        addRow(card, constraints, "Repeated handsign minimum", sliderWithValue(repeatedHandsignMinimum, repeatedHandsignMinimumValue));
+        addRow(card, constraints, "Repeated handsign target", sliderWithValue(repeatedHandsignTarget, repeatedHandsignTargetValue));
         addRow(card, constraints, "Pre-event recording", preEvent);
         addRow(card, constraints, "Post-event recording", postEvent);
         addRow(card, constraints, "Maximum tracked hands", maxHands);
@@ -181,7 +237,22 @@ final class SettingsPanel extends JPanel {
         panel.setOpaque(false);
         panel.add(saveButton);
         panel.add(pauseButton);
+        panel.add(restartButton);
         return panel;
+    }
+
+    private void confirmEngineRestart() {
+        int choice = JOptionPane.showConfirmDialog(
+                this,
+                "Restarting reconnects every enabled camera worker and clears incomplete hand-sign sequences.\n"
+                        + "Saved settings and existing evidence are retained. Unsaved changes will not be applied.\n\n"
+                        + "Restart the vision engine now?",
+                "Restart Engine",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+        if (choice == JOptionPane.YES_OPTION) {
+            restartAction.run();
+        }
     }
 
     private EngineSettings readSettings() {
@@ -194,6 +265,11 @@ final class SettingsPanel extends JPanel {
                 .orElse(configuredCameras.get(0));
         return new EngineSettings(
                 confidence.getValue() / 100.0,
+                gestureSensitivity.getValue() / 100.0,
+                thumbTuckBonus.getValue() / 100.0,
+                indexFoldBonus.getValue() / 100.0,
+                repeatedHandsignMinimum.getValue() / 100.0,
+                repeatedHandsignTarget.getValue() / 100.0,
                 (Integer) preEvent.getValue(),
                 (Integer) postEvent.getValue(),
                 requireThumb.isSelected(),
@@ -214,6 +290,32 @@ final class SettingsPanel extends JPanel {
         peopleInterval.setEnabled(enabled);
         quietThreshold.setEnabled(enabled);
         quietThresholdValue.setEnabled(enabled);
+    }
+
+    private void updateGestureSensitivityLabel() {
+        int value = gestureSensitivity.getValue();
+        String description = value == 100 ? "calibrated" : value > 100 ? "more responsive" : "more strict";
+        gestureSensitivityValue.setText(value + "% — " + description);
+    }
+
+    private void updateConfidenceTuningLabels() {
+        thumbTuckBonusValue.setText(thumbTuckBonus.getValue() + "%");
+        indexFoldBonusValue.setText(indexFoldBonus.getValue() + "%");
+        repeatedHandsignMinimumValue.setText(repeatedHandsignMinimum.getValue() + "%");
+        repeatedHandsignTargetValue.setText(repeatedHandsignTarget.getValue() + "%");
+    }
+
+    /** Preserve the configured value, but do not offer an inapplicable credit control. */
+    private void updateFingerBonusControlState() {
+        boolean thumbRequired = requireThumb.isSelected();
+        thumbTuckBonus.setEnabled(thumbRequired);
+        thumbTuckBonusValue.setEnabled(thumbRequired);
+        thumbTuckBonusValue.setText(thumbRequired ? thumbTuckBonus.getValue() + "%" : "Not used");
+
+        boolean indexRequired = requireIndex.isSelected();
+        indexFoldBonus.setEnabled(indexRequired);
+        indexFoldBonusValue.setEnabled(indexRequired);
+        indexFoldBonusValue.setText(indexRequired ? indexFoldBonus.getValue() + "%" : "Not used");
     }
 
     private static RoundedPanel card() {

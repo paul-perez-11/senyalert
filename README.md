@@ -23,6 +23,17 @@ with the incident.
   World-landmark 3-D angles and optional
   visibility/presence values remain diagnostic evidence rather than loosening
   the temporal gate.
+- **Gesture sensitivity** is independently configurable from 50–150%.  The
+  default 150% reduces the phase margin to 25% of its calibrated value for a
+  clear compact phone-camera close. At maximum it also gives an explicitly
+  reported, bounded score assist only after a near-complete closed phase; a
+  clear front-facing strict or one-finger-near strict SOS can show 100%.
+  Palm/reliability guards and the configured confidence threshold remain in
+  force.
+- Repeated same-hand near-SOS cycles can escalate from a raw score of at least
+  50% to an explicit configured target inside a short time window. The engine
+  publishes raw and effective confidence, and still applies the normal final
+  confidence threshold before creating the incident.
 - VIDEO-mode HandLandmarker detection falls back to IMAGE mode after short
   tracker dropouts and reports `NO HANDS FROM MEDIAPIPE` instead of silently
   remaining in IDLE.
@@ -51,6 +62,14 @@ Install the Python dependencies from the repository root:
 ```powershell
 python -m pip install -r requirements.txt
 ```
+
+## Benchmarking and Chapter 4/5 evidence
+
+Repeatable local profiling, stress, transport, SQLite-persistence, and
+ground-truth event-evaluation tools are documented in
+[docs/benchmarking.md](docs/benchmarking.md). Each run writes raw CSV samples
+and a scope-labelled JSON summary; synthetic queue results and local component
+timings must not be presented as real camera-to-alert latency.
 
 ## Run the local demo
 
@@ -122,16 +141,28 @@ has lower frame rate and higher latency than the raw USB/UVC route above.
    feeds. Each camera gets its own live panel, hand tracking, people count,
    alert cooldown, and evidence capture.
 
-SenyAlert deliberately does not run `adb connect` or change phone debugging
-settings itself. Pair/connect the device explicitly first, then configure the
-already-authorized ADB serial in Settings.
+For Android IP Camera, the **Cameras** tab now has an optional **Android IP
+Camera controls** section on every camera tab. Enter the wireless ADB target
+(for example `192.168.68.113:42573`) or an already-authorized USB serial, the
+laptop listening port, and the phone camera server port. **Connect & forward**
+runs the equivalent safe argument-based ADB commands in the background; **Use
+forwarded stream** fills in `http://127.0.0.1:<laptop-port>/video/mjpeg` for
+you. You must still pair/authorize Android debugging on the phone first—the
+dashboard never changes phone debugging or permission settings.
+
+Those bridge fields are intentionally session-only: they remain filled in if
+you save or reload another camera setting during the same dashboard session,
+but they are not written to the normal camera configuration. This avoids
+leaving a transient wireless-debugging target in a settings file. Added camera
+tabs default to different localhost ports (`17170`, `17171`, and so on); the
+dashboard rejects duplicate ADB listening ports when you save.
 
 ### Raw Android IP Camera through ADB
 
 For an Android 12 phone without native USB Webcam/UVC support, use the
 open-source **Android IP Camera** app to serve the selected phone lens as MJPEG
-instead of using `adb://` screen capture. Start its local server, then forward
-its default phone port to a laptop-only port:
+instead of using `adb://` screen capture. Start its local server, then either
+use the dashboard controls above or forward its default phone port manually:
 
 ```powershell
 adb -s <device-serial> forward tcp:17170 tcp:4444
@@ -143,6 +174,17 @@ recording disabled. The Python engine continuously drains network streams and
 delivers only the latest decoded frame to detection, so a slow detector drops
 stale frames instead of growing visible latency. Reduce the camera's
 `processing_scale` to 0.5–0.75 if the local computer still cannot keep up.
+
+If the selected phone lens supports remote zoom, enter a value from `1.0×` to
+`20.0×` in the same camera tab and select **Apply zoom**. SenyAlert sends the
+control request through the localhost ADB forward, so it does not need the
+phone's LAN address in the camera source. A rejected request means the phone
+app or selected lens does not expose that zoom range.
+
+The zoom control accepts a trusted HTTP/HTTPS endpoint and will not bypass an
+untrusted/self-signed TLS certificate. If Android IP Camera Basic Auth is
+enabled, use a valid authenticated source URL; the zoom command reuses its
+Basic Auth credentials for the single control request and never logs them.
 
 For a secure demo, prefer a USB data cable plus USB debugging. If the phone
 server uses HTTP without app authentication, keep it off public/campus Wi-Fi;
@@ -232,12 +274,26 @@ selects a quiet alert at or above the configured occupancy threshold. It also
 selects quiet while the asynchronous occupancy result is stale, rather than
 assuming the room is empty. Disabling audible alarms makes all alerts quiet.
 
+Gesture-related JSON settings are bounded and echoed in `CONFIG_ACK` and the
+live HUD: `gesture_sensitivity` (0.50–1.50),
+`repeated_handsign_min_confidence` (0.50–0.95),
+`repeated_handsign_confidence_target` (0.50–1.00), and the existing
+`repeated_handsign_window_sec`. `thumb_tuck_confidence_bonus` and
+`index_fold_confidence_bonus` are each 0.00–0.30 (10% is `0.10`). A bonus is
+applied only when the matching `fingers.thumb` or `fingers.index` requirement
+is enabled and its calibrated feature is detected; the dashboard disables the
+associated control while that requirement is unchecked.
+
 ## Evidence and scope notes
 
 `java-dashboard/incidents.db` receives additive schema updates for snapshots,
-clips, paths, occupancy/hand metadata, and media state. The source snapshot and
-MP4 remain on disk for local demo troubleshooting; there is intentionally no
-automatic retention or deletion behavior.
+clips, paths, occupancy/hand metadata, and media state. New live media is kept
+under `evidence/recorded/<camera-id>/videos` and `snapshots`; uploaded-video
+media is kept under `evidence/uploaded/<job-id>/videos` and `snapshots`.
+The legacy media present during this update was moved without deletion into
+`evidence/recorded/legacy/videos` and `evidence/recorded/legacy/snapshots`.
+The engine does not automatically relocate later files or apply retention or
+deletion behavior.
 
 The evidence panel lets operators update only the incident workflow status and
 an operator note. Detection facts, timestamps, confidence, people/hand data,

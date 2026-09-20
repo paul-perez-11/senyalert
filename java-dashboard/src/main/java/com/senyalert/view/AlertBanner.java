@@ -7,7 +7,6 @@ import com.senyalert.view.ui.RoundedPanel;
 import java.awt.BorderLayout;
 import java.awt.Color;
 import java.awt.Font;
-import java.awt.Toolkit;
 import javax.swing.BorderFactory;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
@@ -23,7 +22,6 @@ final class AlertBanner extends RoundedPanel {
     private final Timer pulseTimer;
     private Incident currentIncident;
     private boolean brightPhase;
-    private int beepsRemaining;
 
     AlertBanner() {
         super(14);
@@ -55,12 +53,7 @@ final class AlertBanner extends RoundedPanel {
         }
         currentIncident = incident;
         brightPhase = true;
-        beepsRemaining = incident.alertMode() == AlertMode.AUDIBLE ? 3 : 0;
         updateColors();
-        if (beepsRemaining > 0) {
-            Toolkit.getDefaultToolkit().beep();
-            beepsRemaining--;
-        }
         pulseTimer.start();
     }
 
@@ -68,7 +61,6 @@ final class AlertBanner extends RoundedPanel {
         pulseTimer.stop();
         currentIncident = null;
         brightPhase = false;
-        beepsRemaining = 0;
         setBackground(new Color(228, 244, 237));
         icon.setIcon(FontIcon.of(FontAwesomeSolid.CHECK, 15, BlueTheme.SUCCESS));
         title.setForeground(BlueTheme.SUCCESS.darker());
@@ -83,10 +75,6 @@ final class AlertBanner extends RoundedPanel {
         }
         brightPhase = !brightPhase;
         updateColors();
-        if (currentIncident.alertMode() == AlertMode.AUDIBLE && beepsRemaining > 0 && brightPhase) {
-            Toolkit.getDefaultToolkit().beep();
-            beepsRemaining--;
-        }
     }
 
     private void updateColors() {

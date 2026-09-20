@@ -1,9 +1,12 @@
-"""SenyAlert local vision engine.
+"""SenyAlert local vision engine compatibility launcher.
 
-The engine deliberately keeps computer vision, transport, and evidence capture
-separate.  Hand geometry is calculated from MediaPipe *world* landmarks in
-three dimensions.  Normalized 2-D coordinates are retained only for the live
-preview and inexpensive frame-to-frame hand association.
+Live gesture geometry and temporal tracking are isolated in
+``senyalert_engine.gesture``; the OpenCV-only overlay is isolated in
+``senyalert_engine.hud``.  This launcher retains capture, transport, evidence,
+and dashboard protocol compatibility while the active detector uses a
+palm-relative version of the groupmate's normalized landmark rules.  World
+landmarks provide orientation diagnostics and back-of-palm protection, never a
+second hidden confidence multiplier.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -37,7 +41,17 @@ from mediapipe.tasks.python import vision
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
-SNAPSHOT_DIR = PROJECT_ROOT / "snapshots"
+# ``runpy.run_path`` callers do not automatically add this file's directory to
+# ``sys.path``.  Keep the modular engine importable for deterministic benchmark
+# scripts as well as the normal ``python src/python-prototype.py`` launch.
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+# Keep new media out of the project root.  Existing root-level files are left
+# untouched because a dashboard/archive may still refer to their old paths.
+EVIDENCE_ROOT_DIR = PROJECT_ROOT / "evidence"
+RECORDED_EVIDENCE_DIR = EVIDENCE_ROOT_DIR / "recorded"
+UPLOADED_EVIDENCE_DIR = EVIDENCE_ROOT_DIR / "uploaded"
+SNAPSHOT_DIR = RECORDED_EVIDENCE_DIR / "CAM-UNKNOWN" / "snapshots"
 WS_URL = os.environ.get("SENYALERT_WS_URL", "ws://localhost:8080")
 _ADB_SERIAL_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _UVC_DEVICE_INDEX_PATTERN = re.compile(r"\d{1,9}")
@@ -119,6 +133,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "landmark_presence_threshold": 0.35,
     # SOS sequence and tracking settings.
     "confidence_threshold": 0.70,
+    # 100% is the groupmate-compatible geometry.  The modular gesture reader
+    # applies this setting consistently to phase flags, confidence, and
+    # thumb/index bonuses (rather than treating it as a display-only assist).
+    "gesture_sensitivity": 1.50,
+    # These are additive confidence credits (0.10 = 10 percentage points),
+    # but only while the matching requirement is enabled and visibly met.
+    # The dashboard hides each control when its checkbox is not selected.
+    "thumb_tuck_confidence_bonus": 0.10,
+    "index_fold_confidence_bonus": 0.10,
     "fingers": {
         "thumb": True,
         "index": True,
@@ -135,9 +158,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "close_hold_frames": 3,
     "sequence_max_duration_sec": 4.0,
     "open_lost_grace_sec": 0.60,
-    "hand_match_max_dist": 0.20,
+    # A palm-centre match keeps one demonstrator's open-to-close sequence
+    # stable while their hand moves. Multi-hand assignment remains one-to-one.
+    "hand_match_max_dist": 0.32,
     "hand_track_stale_sec": 1.0,
     "alert_cooldown_sec": 3.0,
+    # A repeated Signal-for-Help motion is recorded separately from a single
+    # confirmed sequence.  This is deliberately a short, same-hand window:
+    # it is a persistence signal, never a replacement for the strict SOS gate.
+    "repeated_handsign_min_cycles": 2,
+    "repeated_handsign_window_sec": 7.0,
+    # A repeated same-hand near-SOS may be escalated only after its raw score
+    # reaches this qualifying floor.  Its score can then rise to this explicit
+    # target, but the normal confidence_threshold remains the final event gate.
+    "repeated_handsign_min_confidence": 0.50,
+    "repeated_handsign_confidence_target": 0.75,
     # World-space geometry is telemetry/soft corroboration only. The phase
     # driver intentionally uses the proven normalized 2-D temporal reading.
     "finger_extended_angle_deg": 155.0,
@@ -246,6 +281,13 @@ def display_aspect_ratio(width: int, height: int) -> str:
         return "unknown aspect"
     divisor = math.gcd(width, height)
     return f"{width // divisor}:{height // divisor}"
+
+
+def evidence_camera_directory_name(camera_id: Any) -> str:
+    """Return one harmless, readable folder component for a camera ID."""
+    raw = str(camera_id or "CAM-UNKNOWN").strip()
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip(".-")
+    return (safe or "CAM-UNKNOWN")[:80]
 
 
 def camera_input_kind(source: Any) -> str:
@@ -416,6 +458,9 @@ class ConfigStore:
 
     _FLOAT_RANGES = {
         "confidence_threshold": (0.0, 1.0),
+        "gesture_sensitivity": (0.50, 1.50),
+        "thumb_tuck_confidence_bonus": (0.0, 0.30),
+        "index_fold_confidence_bonus": (0.0, 0.30),
         "min_hand_detection_confidence": (0.0, 1.0),
         "min_hand_presence_confidence": (0.0, 1.0),
         "min_hand_tracking_confidence": (0.0, 1.0),
@@ -426,6 +471,9 @@ class ConfigStore:
         "hand_match_max_dist": (0.02, 1.0),
         "hand_track_stale_sec": (0.1, 20.0),
         "alert_cooldown_sec": (0.0, 300.0),
+        "repeated_handsign_window_sec": (1.0, 30.0),
+        "repeated_handsign_min_confidence": (0.50, 0.95),
+        "repeated_handsign_confidence_target": (0.50, 1.0),
         "finger_extended_angle_deg": (120.0, 180.0),
         "finger_curled_angle_deg": (20.0, 150.0),
         "finger_extended_tip_palm_ratio": (0.25, 4.0),
@@ -450,6 +498,7 @@ class ConfigStore:
         "open_hold_frames": (1, 20),
         "thumb_tuck_hold_frames": (1, 20),
         "close_hold_frames": (1, 30),
+        "repeated_handsign_min_cycles": (2, 8),
         "people_detection_interval_frames": (1, 120),
         "people_detection_max_width": (160, 1920),
         "quiet_people_threshold": (0, 1000),
@@ -649,7 +698,19 @@ class EngineSocketClient:
         self._send_lock = threading.Lock()
         self._app: Optional[websocket.WebSocketApp] = None
         self._pending: Deque[str] = deque(maxlen=200)
+        self._uploaded_video_handler: Optional[Callable[[Dict[str, Any]], Tuple[bool, str]]] = None
+        self._restart_handler: Optional[Callable[[], Tuple[bool, str]]] = None
         self._thread = threading.Thread(target=self._run, name="senyalert-websocket", daemon=True)
+
+    def set_uploaded_video_handler(
+        self, handler: Optional[Callable[[Dict[str, Any]], Tuple[bool, str]]]
+    ) -> None:
+        """Register the engine-owned, non-blocking local-upload command handler."""
+        self._uploaded_video_handler = handler
+
+    def set_restart_handler(self, handler: Optional[Callable[[], Tuple[bool, str]]]) -> None:
+        """Register the main-loop-owned live-worker restart request handler."""
+        self._restart_handler = handler
 
     def start(self) -> None:
         self._thread.start()
@@ -723,7 +784,28 @@ class EngineSocketClient:
             action = data.get("action")
             if action == "UPDATE_SETTINGS":
                 applied, rejected = self.config.apply(data.get("config", {}))
-                status = "Engine configuration successfully reloaded."
+                effective_config, revision = self.config.snapshot()
+                enabled_cameras = configured_cameras(effective_config)
+                quiet_threshold = int(effective_config["quiet_at_or_above_people"])
+                people_enabled = bool(effective_config["people_detection_enabled"])
+                audible_enabled = bool(effective_config["audible_alerts_enabled"])
+                thresholds = effective_thresholds(effective_config)
+                gesture_sensitivity = thresholds["sensitivity"]
+                phase_margin = thresholds["finger_margin"]
+                repeat_policy = repeated_handsign_policy(effective_config)
+                thumb_required = bool(effective_config["fingers"].get("thumb", True))
+                index_required = bool(effective_config["fingers"].get("index", True))
+                status = (
+                    "Engine configuration successfully reloaded "
+                    f"(revision {revision}; quiet at {quiet_threshold}+ people; "
+                    f"gesture sensitivity {gesture_sensitivity:.0%} "
+                    f"(phase margin {phase_margin:.3f}); "
+                    f"repeat ≥{repeat_policy['minimum_confidence']:.0%}→"
+                    f"{repeat_policy['confidence_target']:.0%} within "
+                    f"{float(effective_config['repeated_handsign_window_sec']):.0f}s; "
+                    f"people detection {'on' if people_enabled else 'off'}; "
+                    f"audible alarms {'on' if audible_enabled else 'off'})."
+                )
                 if rejected:
                     status = "Configuration applied with validation warnings."
                 self.send({
@@ -731,9 +813,66 @@ class EngineSocketClient:
                     "status": status,
                     "applied_fields": applied,
                     "rejected_fields": rejected,
+                    # Echo the policy actually held by the shared ConfigStore,
+                    # not merely the dashboard's requested values.  This makes
+                    # a multi-camera demo diagnosable without exposing sources.
+                    "config_revision": revision,
+                    "quiet_at_or_above_people": quiet_threshold,
+                    "people_detection_enabled": people_enabled,
+                    "audible_alerts_enabled": audible_enabled,
+                    # Echo phase/repeat/bonus policy so the dashboard can
+                    # visibly prove that a slider changed engine behavior.
+                    "gesture_sensitivity": round(gesture_sensitivity, 3),
+                    "gesture_phase_margin": round(phase_margin, 4),
+                    "repeated_handsign_min_confidence": round(repeat_policy["minimum_confidence"], 4),
+                    "repeated_handsign_confidence_target": round(repeat_policy["confidence_target"], 4),
+                    "repeated_handsign_window_sec": float(effective_config["repeated_handsign_window_sec"]),
+                    "thumb_tuck_required": thumb_required,
+                    "thumb_tuck_confidence_bonus": round(
+                        _configured_fraction(effective_config, "thumb_tuck_confidence_bonus", 0.10), 4
+                    ),
+                    "index_fold_required": index_required,
+                    "index_fold_confidence_bonus": round(
+                        _configured_fraction(effective_config, "index_fold_confidence_bonus", 0.10), 4
+                    ),
+                    "enabled_camera_ids": [camera["camera_id"] for camera in enabled_cameras],
                 })
             elif action == "PAUSE":
                 ok, status = self.config.set_paused(data.get("state"))
+                self.send({"event": "CONFIG_ACK", "status": status, "ok": ok})
+            elif action == "RESTART_ENGINE":
+                handler = self._restart_handler
+                if handler is None:
+                    self.send({
+                        "event": "CONFIG_ACK",
+                        "status": "Engine restart is not ready yet.",
+                        "ok": False,
+                    })
+                else:
+                    ok, status = handler()
+                    self.send({"event": "CONFIG_ACK", "status": status, "ok": ok})
+            elif action == "PROCESS_UPLOADED_VIDEO":
+                handler = self._uploaded_video_handler
+                if handler is None:
+                    ok, status = False, "Offline video analysis is not ready yet."
+                else:
+                    try:
+                        ok, status = handler(data)
+                    except Exception as exc:
+                        ok, status = False, f"Could not queue offline video analysis: {exc}"
+                if not ok:
+                    raw_source = data.get("source_path")
+                    source_name = Path(raw_source).name if isinstance(raw_source, str) and raw_source.strip() else "video"
+                    self.send({
+                        "event": "UPLOADED_VIDEO_STATUS",
+                        "archive_source": "UPLOADED",
+                        "stage": "FAILED",
+                        "source_name": source_name,
+                        "detail": status,
+                        "processed_frames": 0,
+                        "total_frames": 0,
+                        "detected_incidents": 0,
+                    })
                 self.send({"event": "CONFIG_ACK", "status": status, "ok": ok})
             else:
                 self.send({"event": "CONFIG_ACK", "status": "Unknown engine action ignored.", "ok": False})
@@ -779,6 +918,18 @@ FINGER_JOINTS = {
     "pinky": (17, 18, 19, 20),
 }
 PALM_MCP_INDICES = (5, 9, 13, 17)
+FINGER_LANDMARK_INDICES = {
+    "thumb": (1, 2, 3, 4),
+    "index": (5, 6, 7, 8),
+    "middle": (9, 10, 11, 12),
+    "ring": (13, 14, 15, 16),
+    "pinky": (17, 18, 19, 20),
+}
+LANDMARK_TO_FINGER = {
+    landmark_index: finger
+    for finger, landmark_indices in FINGER_LANDMARK_INDICES.items()
+    for landmark_index in landmark_indices
+}
 
 
 def _point3(landmark: Any) -> Tuple[float, float, float]:
@@ -820,12 +971,58 @@ def landmark_confidence_status(
     score, while an available low score causes that frame to be skipped.
     """
     if not screen_landmarks:
-        return {"passed": False, "available": False, "reason": "screen_landmarks_missing"}
+        return {
+            "passed": False,
+            "available": False,
+            "reason": "screen_landmarks_missing",
+            "quality": 0.0,
+            "finger_quality": {},
+        }
 
+    enabled_fingers = [name for name in FINGER_LANDMARK_INDICES if config["fingers"].get(name, True)]
+    values_by_finger: Dict[str, List[float]] = {name: [] for name in enabled_fingers}
+    palm_values: List[float] = []
     observed = 0
+
+    def quality_metadata() -> Dict[str, Any]:
+        """Return conservative reliability diagnostics without fabricating scores."""
+        if observed == 0:
+            # Some HandLandmarker builds omit visibility/presence entirely.
+            # That is not evidence that a finger is hidden, so preserve the
+            # geometry-only score rather than inventing a low certainty value.
+            return {
+                "quality": 1.0,
+                "finger_quality": {},
+                "observed_fingers": 0,
+            }
+        finger_quality = {
+            finger: round(sum(values) / len(values), 4) if values else 0.0
+            for finger, values in values_by_finger.items()
+        }
+        observed_fingers = sum(1 for values in values_by_finger.values() if values)
+        finger_average = (
+            sum(finger_quality.values()) / len(finger_quality)
+            if finger_quality else 0.0
+        )
+        palm_quality = sum(palm_values) / len(palm_values) if palm_values else finger_average
+        # Finer per-finger reliability makes a partly occluded hand less
+        # confident even when every available value still clears the hard
+        # configured visibility/presence gate.
+        return {
+            "quality": round(_unit_interval(0.85 * finger_average + 0.15 * palm_quality), 4),
+            "finger_quality": finger_quality,
+            "observed_fingers": observed_fingers,
+        }
+
     for index in _required_landmark_indices(config):
         if index >= len(screen_landmarks):
-            return {"passed": False, "available": False, "reason": f"landmark_{index}_missing"}
+            return {
+                "passed": False,
+                "available": False,
+                "reason": f"landmark_{index}_missing",
+                "quality": 0.0,
+                "finger_quality": {},
+            }
         landmark = screen_landmarks[index]
         for attribute, threshold_key in (
             ("visibility", "landmark_visibility_threshold"),
@@ -839,6 +1036,12 @@ def landmark_confidence_status(
             except (TypeError, ValueError):
                 continue
             observed += 1
+            normalized = _unit_interval(numeric)
+            finger = LANDMARK_TO_FINGER.get(index)
+            if finger in values_by_finger:
+                values_by_finger[finger].append(normalized)
+            else:
+                palm_values.append(normalized)
             if numeric < config[threshold_key]:
                 return {
                     "passed": False,
@@ -846,6 +1049,7 @@ def landmark_confidence_status(
                     "reason": f"{attribute}_below_threshold",
                     "landmark_index": index,
                     "value": numeric,
+                    **quality_metadata(),
                 }
 
     if observed == 0:
@@ -853,8 +1057,14 @@ def landmark_confidence_status(
             "passed": True,
             "available": False,
             "reason": "visibility_and_presence_not_provided_by_hand_landmarker",
+            **quality_metadata(),
         }
-    return {"passed": True, "available": True, "checked_values": observed}
+    return {
+        "passed": True,
+        "available": True,
+        "checked_values": observed,
+        **quality_metadata(),
+    }
 
 
 def _point2(landmark: Any) -> Tuple[float, float]:
@@ -867,6 +1077,118 @@ def _distance2(first: Tuple[float, float], second: Tuple[float, float]) -> float
 
 def _projection2(vector: Tuple[float, float], axis: Tuple[float, float]) -> float:
     return vector[0] * axis[0] + vector[1] * axis[1]
+
+
+def _unit_interval(value: float) -> float:
+    """Clamp a finite calibration component to the public 0–1 range."""
+    if not math.isfinite(value):
+        return 0.0
+    return max(0.0, min(1.0, value))
+
+
+def _above_margin_quality(value: float, threshold: float, full_credit_span: float) -> float:
+    """Score how decisively a signed screen-space margin clears its gate."""
+    return _unit_interval((value - threshold) / max(1e-6, full_credit_span))
+
+
+def _below_margin_quality(value: float, threshold: float, comfort_span: float) -> float:
+    """Score a "below threshold" metric, giving an edge value half credit."""
+    return _unit_interval((threshold + comfort_span - value) / max(1e-6, comfort_span * 2.0))
+
+
+def _gesture_sensitivity(config: Dict[str, Any]) -> float:
+    """Return the bounded geometry responsiveness without altering confidence.
+
+    The sensitivity setting is deliberately kept out of the quality score.
+    It only relaxes or tightens the groupmate-compatible *phase* margins,
+    while ``confidence_threshold`` still decides whether that qualified phase
+    may create an incident.  This makes a high sensitivity setting useful for
+    compact phone-camera gestures without silently turning a low-quality pose
+    into a high-confidence alert.
+    """
+    try:
+        value = float(config.get("gesture_sensitivity", 1.0))
+    except (TypeError, ValueError):
+        value = 1.0
+    return max(0.50, min(1.50, value))
+
+
+def _sensitivity_adjusted_phase_margin(margin: float, sensitivity: float) -> float:
+    """Scale a signed lower-bound margin by the operator sensitivity.
+
+    At 100% the calibrated margin is unchanged.  The upper half of the slider
+    is intentionally steeper: at 150%, just 25% of the calibrated margin is
+    required, so a phone-camera close visibly advances phases that 100% keeps
+    waiting on.  At 50% the phase rule is 50% stricter.  The caller must
+    continue using the calibrated margin for confidence scoring.
+    """
+    if sensitivity <= 1.0:
+        multiplier = 2.0 - sensitivity
+    else:
+        # Keep a non-zero lower bound: high sensitivity changes phase
+        # progression, never turns an arbitrary flat hand into a closed fist.
+        multiplier = 1.0 - 1.5 * (sensitivity - 1.0)
+    return max(0.0, margin * max(0.25, multiplier))
+
+
+def _sensitivity_adjusted_thumb_ratio(ratio: float, sensitivity: float) -> float:
+    """Increase/decrease thumb-tuck acceptance independently of quality."""
+    return max(1e-6, ratio * sensitivity)
+
+
+def _configured_fraction(config: Dict[str, Any], key: str, default: float) -> float:
+    """Read a public 0–1 confidence setting safely from live configuration."""
+    try:
+        value = float(config.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return _unit_interval(value)
+
+
+def repeated_handsign_policy(config: Dict[str, Any]) -> Dict[str, float]:
+    """Return the visible, bounded policy used for repeat escalation.
+
+    ``confidence_target`` is an explicit floor reached by a qualifying second
+    same-hand SOS-like cycle; it is not a replacement for the global final
+    ``confidence_threshold`` gate in the camera worker.
+    """
+    minimum = max(
+        0.50,
+        min(0.95, _configured_fraction(config, "repeated_handsign_min_confidence", 0.50)),
+    )
+    target = max(
+        minimum,
+        _configured_fraction(config, "repeated_handsign_confidence_target", 0.75),
+    )
+    return {"minimum_confidence": minimum, "confidence_target": target}
+
+
+def _world_palm_facing_quality(points: Sequence[Tuple[float, float, float]]) -> Optional[float]:
+    """Estimate whether the palm plane faces the camera from world landmarks.
+
+    MediaPipe world coordinates use image-aligned X/Y axes and a depth Z axis.
+    A front-facing palm therefore has a palm-plane normal with a large Z
+    component; an edge-on palm has very little.  This remains a *confidence*
+    penalty rather than a gesture-phase gate because world depth can be noisy
+    on compact fists.
+    """
+    try:
+        across = tuple(points[17][axis] - points[5][axis] for axis in range(3))
+        along = tuple(points[9][axis] - points[0][axis] for axis in range(3))
+        normal = (
+            across[1] * along[2] - across[2] * along[1],
+            across[2] * along[0] - across[0] * along[2],
+            across[0] * along[1] - across[1] * along[0],
+        )
+        normal_length = math.sqrt(sum(component * component for component in normal))
+        if normal_length < 1e-8:
+            return None
+        camera_alignment = abs(normal[2]) / normal_length
+    except (IndexError, TypeError, ValueError):
+        return None
+    # Do not require a mathematically perfect frontal palm; the full score is
+    # reached before a hand has to be unnaturally flat to the lens.
+    return _above_margin_quality(camera_alignment, 0.22, 0.58)
 
 
 def analyze_screen_hand(screen_landmarks: Optional[Sequence[Any]], config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -900,36 +1222,82 @@ def analyze_screen_hand(screen_landmarks: Optional[Sequence[Any]], config: Dict[
         sum(points[index][0] for index in PALM_MCP_INDICES) / len(PALM_MCP_INDICES),
         sum(points[index][1] for index in PALM_MCP_INDICES) / len(PALM_MCP_INDICES),
     )
-    margin = float(config["screen_finger_margin"])
+    # Keep the group's calibrated margin as the quality reference.  Higher
+    # sensitivity changes phase progression and contributes only a bounded,
+    # clearly-labelled assist after a complete phase-qualified close exists.
+    calibrated_margin = float(config["screen_finger_margin"])
+    gesture_sensitivity = _gesture_sensitivity(config)
+    phase_margin = _sensitivity_adjusted_phase_margin(calibrated_margin, gesture_sensitivity)
     enabled_fingers = [name for name in FINGER_JOINTS if config["fingers"].get(name, True)]
     if not enabled_fingers:
         return None
 
     extended_count = 0
     curled_count = 0
+    calibrated_curled_count = 0
+    curl_depth_quality_total = 0.0
+    curl_position_quality_total = 0.0
     finger_metrics: Dict[str, Dict[str, Any]] = {}
     for name, (mcp, pip, _dip, tip) in FINGER_JOINTS.items():
         # This is the exact groupmate shape test, adapted only to this file's
         # MCP/PIP/DIP/tip tuple order.  A fist must put every fingertip below
         # its MCP -- merely bending below the PIP is not enough.
-        extended = (points[pip][1] - points[tip][1]) / palm_scale > margin
-        curled = (points[tip][1] - points[mcp][1]) / palm_scale > margin
+        extension_margin = (points[pip][1] - points[tip][1]) / palm_scale
+        curl_margin = (points[tip][1] - points[mcp][1]) / palm_scale
+        extended = extension_margin > phase_margin
+        curled = curl_margin > phase_margin
+        calibrated_curled = curl_margin > calibrated_margin
         if name in enabled_fingers:
             extended_count += int(extended)
             curled_count += int(curled)
+            calibrated_curled_count += int(calibrated_curled)
+            # Preserve the groupmate's binary curl gate above, but calculate a
+            # soft pre-/post-gate score for confidence.  At the strict margin
+            # this gives half credit, so the last finger cannot turn a score
+            # from zero into a near-perfect confidence in one frame.
+            curl_position_quality = _above_margin_quality(
+                curl_margin,
+                calibrated_margin - max(0.10, calibrated_margin * 2.0),
+                max(0.20, calibrated_margin * 4.0),
+            )
+            curl_depth_quality = _above_margin_quality(
+                curl_margin, calibrated_margin, max(0.10, calibrated_margin * 3.0)
+            )
+            curl_position_quality_total += curl_position_quality
+            curl_depth_quality_total += curl_depth_quality
+        else:
+            curl_position_quality = 0.0
+            curl_depth_quality = 0.0
         finger_metrics[name] = {
             "groupmate_extended": extended,
             "groupmate_curled": curled,
+            "calibrated_curled": calibrated_curled,
+            "extension_margin": round(extension_margin, 3),
+            "curl_margin": round(curl_margin, 3),
+            "phase_margin": round(phase_margin, 3),
+            "calibrated_margin": round(calibrated_margin, 3),
+            "curl_position_quality": round(curl_position_quality, 4),
+            "curl_depth_quality": round(curl_depth_quality, 4),
         }
 
     thumb_tip_to_palm = _distance2(points[4], palm_center) / palm_scale
     thumb_tuck_required = bool(config["fingers"].get("thumb", True))
-    thumb_tucked = thumb_tip_to_palm < float(config["screen_thumb_tucked_ratio"])
+    calibrated_thumb_tuck_threshold = float(config["screen_thumb_tucked_ratio"])
+    phase_thumb_tuck_threshold = _sensitivity_adjusted_thumb_ratio(
+        calibrated_thumb_tuck_threshold, gesture_sensitivity
+    )
+    calibrated_thumb_tucked = thumb_tip_to_palm < calibrated_thumb_tuck_threshold
+    thumb_tucked = thumb_tip_to_palm < phase_thumb_tuck_threshold
     thumb_requirement_met = thumb_tucked or not thumb_tuck_required
     selected_count = len(enabled_fingers)
     open_minimum = min(selected_count, int(config["screen_open_min_extended"]))
     closed_minimum = min(selected_count, int(config["screen_closed_min_curled"]))
     upright = points[0][1] > points[9][1]
+    palm_width_ratio = _distance2(points[5], points[17]) / palm_scale
+    # When a palm turns edge-on, its across-palm span is heavily foreshortened
+    # in image space.  This is a soft certainty signal only; the original
+    # screen-space SOS phase gate remains untouched.
+    screen_palm_facing_quality = _above_margin_quality(palm_width_ratio, 0.38, 0.62)
 
     is_open = upright and extended_count >= open_minimum
     is_closed = upright and thumb_requirement_met and curled_count >= closed_minimum
@@ -942,27 +1310,167 @@ def analyze_screen_hand(screen_landmarks: Optional[Sequence[Any]], config: Dict[
         and extended_count >= open_minimum
         and curled_count < closed_minimum
     )
+    # A near-complete tuck is useful only to recognize a *repeated* SOS-like
+    # motion.  It never confirms an incident by itself: the state machine
+    # below still requires a fully qualified strict close and confidence gate.
+    sos_like_close = (
+        upright
+        and thumb_requirement_met
+        and curled_count >= max(2, closed_minimum - 1)
+        and screen_palm_facing_quality >= 0.35
+    )
 
-    # A completed screen-space sequence should not be rejected by an unrelated
-    # world-angle score.  The old demo intentionally treated this as a strong
-    # positive after the temporal open->close safeguards had been satisfied.
-    closed_fraction = min(1.0, curled_count / max(1, closed_minimum))
-    thumb_quality = 1.0 if not thumb_tuck_required else float(thumb_tucked)
-    confidence = (0.75 * closed_fraction + 0.25 * thumb_quality) if is_closed else 0.0
+    # Calibrate the completed-fist quality from the same signed, normalized
+    # 2-D margins that drive the groupmate's proven temporal gate.  A fingertip
+    # or thumb merely touching a threshold receives limited credit; deeply
+    # curled fingers, a tucked thumb, and an upright palm approach 1.0.  The
+    # binary phase booleans above are deliberately unchanged.
+    # Do not let the sensitivity slider manufacture confidence by converting
+    # a marginal finger into a binary point.  The phase may be more tolerant,
+    # but this score remains calibrated against the 100% groupmate margin.
+    curled_fraction = calibrated_curled_count / selected_count
+    curl_position_quality = curl_position_quality_total / selected_count
+    curl_depth_quality = curl_depth_quality_total / selected_count
+    # Most of the finger contribution is continuous position quality.  The
+    # small binary component keeps a truly complete fist distinguishable while
+    # preventing a hypersensitive final-finger step.
+    finger_tuck_quality = _unit_interval(0.85 * curl_position_quality + 0.15 * curled_fraction)
+    thumb_quality = (
+        1.0
+        if not thumb_tuck_required
+        else _below_margin_quality(
+            thumb_tip_to_palm,
+            calibrated_thumb_tuck_threshold,
+            max(0.08, calibrated_thumb_tuck_threshold * 0.30),
+        )
+    )
+    # Requirement bonuses are intentionally measured against calibrated
+    # geometry, not the sensitivity-relaxed phase.  Sensitivity can therefore
+    # make a legitimate compact motion progress, but cannot manufacture a
+    # thumb/index score credit from a marginal joint position.
+    thumb_tuck_bonus = (
+        _configured_fraction(config, "thumb_tuck_confidence_bonus", 0.10)
+        if thumb_tuck_required and calibrated_thumb_tucked
+        else 0.0
+    )
+    index_required = bool(config["fingers"].get("index", True))
+    index_folded = bool(finger_metrics.get("index", {}).get("calibrated_curled"))
+    index_fold_bonus = (
+        _configured_fraction(config, "index_fold_confidence_bonus", 0.10)
+        if index_required and index_folded
+        else 0.0
+    )
+    requirement_bonus_total = thumb_tuck_bonus + index_fold_bonus
+    upright_margin = (points[0][1] - points[9][1]) / palm_scale
+    upright_quality = _above_margin_quality(upright_margin, 0.0, 0.45)
+    closed_pose_quality = _unit_interval(
+        0.55 * finger_tuck_quality
+        + 0.15 * curl_depth_quality
+        + 0.15 * thumb_quality
+        + 0.05 * upright_quality
+        + 0.10 * screen_palm_facing_quality
+    )
+    # Make the sensitivity control perceptible in the displayed/event score,
+    # but only for an already phase-qualified, nearly calibrated close.  It
+    # cannot help an open hand, missing thumb requirement, unreliable palm,
+    # or a close with more than one weak finger.  At max sensitivity this is
+    # up to a 12-point assist, enough for a clearly visible compact gesture
+    # to reach the configured final gate without erasing false-positive guards.
+    sensitivity_fraction = _unit_interval((gesture_sensitivity - 1.0) / 0.50)
+    sensitivity_eligible = bool(
+        is_closed
+        and thumb_requirement_met
+        and calibrated_curled_count >= max(1, selected_count - 1)
+        and curl_position_quality >= 0.85
+        and thumb_quality >= 0.80
+        and upright_quality >= 0.85
+        and screen_palm_facing_quality >= 0.85
+    )
+    sensitivity_confidence_assist = (
+        0.12 * sensitivity_fraction * min(1.0, curl_position_quality)
+        if sensitivity_eligible
+        else 0.0
+    )
+    # Report progressive confidence while fingers close so operators can see
+    # why a gesture has not met the threshold.  Confirmation remains guarded
+    # by the unchanged strict `is_closed` rule in SignalStateMachine.
+    # A gentle concave activation gives early, correctly tucked fingers useful
+    # credit and distributes the final-finger contribution more evenly instead
+    # of making one last binary curl disproportionately decisive.
+    confidence_before_requirement_bonuses = _unit_interval(
+        closed_pose_quality * (finger_tuck_quality ** 0.65)
+    )
+    confidence = _unit_interval(
+        confidence_before_requirement_bonuses
+        + requirement_bonus_total
+        + sensitivity_confidence_assist
+    )
+    # A visibly complete strict SOS should not stall at 96–99% solely because
+    # a high-quality landmark reliability factor is slightly below one.  This
+    # marker is subsequently checked against reliability/palm safeguards in
+    # combine_hand_readings before a final 100% can be shown.
+    strict_complete = bool(
+        is_closed
+        and calibrated_curled_count == selected_count
+        and (not thumb_tuck_required or calibrated_thumb_tucked)
+        and finger_tuck_quality >= 0.90
+        and curl_depth_quality >= 0.90
+        and upright_quality >= 0.85
+        and screen_palm_facing_quality >= 0.85
+    )
+    sensitivity_assisted_complete = bool(
+        sensitivity_eligible
+        and gesture_sensitivity >= 1.45
+        and calibrated_curled_count >= selected_count - 1
+        and (not thumb_tuck_required or calibrated_thumb_tucked)
+    )
     return {
         "is_open": is_open,
         "is_closed": is_closed,
         "thumb_tucked": thumb_tucked,
+        "calibrated_thumb_tucked": calibrated_thumb_tucked,
         "thumb_tuck_required": thumb_tuck_required,
         "thumb_requirement_met": thumb_requirement_met,
-        "confidence": confidence,
+        "index_folded": index_folded,
+        "index_fold_required": index_required,
+        "strict_complete": strict_complete,
+        "sensitivity_assisted_complete": sensitivity_assisted_complete,
+        "confidence": round(confidence, 4),
+        "confidence_components": {
+            "curled_fraction": round(curled_fraction, 4),
+            "curl_position": round(curl_position_quality, 4),
+            "curl_depth": round(curl_depth_quality, 4),
+            "finger_tuck": round(finger_tuck_quality, 4),
+            "thumb_tuck": round(thumb_quality, 4),
+            "thumb_tuck_bonus": round(thumb_tuck_bonus, 4),
+            "index_fold_bonus": round(index_fold_bonus, 4),
+            "requirement_bonus_total": round(requirement_bonus_total, 4),
+            "confidence_before_requirement_bonuses": round(confidence_before_requirement_bonuses, 4),
+            "sensitivity_confidence_assist": round(sensitivity_confidence_assist, 4),
+            "sensitivity_eligible": sensitivity_eligible,
+            "upright": round(upright_quality, 4),
+            "screen_palm_facing": round(screen_palm_facing_quality, 4),
+            "closed_pose_quality": round(closed_pose_quality, 4),
+            "gesture_sensitivity": round(gesture_sensitivity, 3),
+            "phase_finger_margin": round(phase_margin, 4),
+            "phase_thumb_tuck_ratio": round(phase_thumb_tuck_threshold, 4),
+            "phase_curled_count": curled_count,
+            "calibrated_curled_count": calibrated_curled_count,
+            "strict_complete": strict_complete,
+            "sensitivity_assisted_complete": sensitivity_assisted_complete,
+        },
         "phase_driver": "screen_2d_groupmate_strict",
         "thumb_tip_to_palm_ratio": round(thumb_tip_to_palm, 3),
+        "gesture_sensitivity": round(gesture_sensitivity, 3),
         "thumb_ip_angle_deg": None,
         "extended_count": extended_count,
         "curled_count": curled_count,
+        "calibrated_curled_count": calibrated_curled_count,
         "required_finger_count": selected_count,
         "is_thumb_tuck_phase": is_thumb_tuck_phase,
+        "sos_like_close": sos_like_close,
+        "palm_width_ratio": round(palm_width_ratio, 4),
+        "palm_facing_quality": round(screen_palm_facing_quality, 4),
         # Keep these compatibility keys for consumers which already display
         # the old diagnostic field names.  There is no permissive palm-axis
         # alternative in the strict groupmate gate.
@@ -994,6 +1502,62 @@ def combine_hand_readings(
     if screen is None:
         return None
     reading = dict(screen)
+    screen_palm_facing = _unit_interval(float(screen.get("palm_facing_quality", 0.0)))
+    world_palm_facing: Optional[float] = None
+    if world is not None and world.get("palm_facing_quality") is not None:
+        try:
+            world_palm_facing = _unit_interval(float(world["palm_facing_quality"]))
+        except (TypeError, ValueError):
+            world_palm_facing = None
+    if world_palm_facing is None:
+        palm_facing_quality = screen_palm_facing
+    else:
+        # A strong projected width cannot fully hide a poor 3-D palm-normal
+        # reading (or vice versa).  Weight the weaker observation more to make
+        # oblique palms visibly less confident without rejecting them outright.
+        palm_facing_quality = 0.70 * min(screen_palm_facing, world_palm_facing) + 0.30 * max(
+            screen_palm_facing, world_palm_facing
+        )
+    landmark_reliability = _unit_interval(float(visibility.get("quality", 1.0)))
+    palm_facing_factor = 0.25 + 0.75 * palm_facing_quality
+    landmark_reliability_factor = 0.35 + 0.65 * landmark_reliability
+    base_confidence = _unit_interval(float(screen.get("confidence", 0.0)))
+    final_confidence = _unit_interval(base_confidence * palm_facing_factor * landmark_reliability_factor)
+    # Preserve the reliability/palm penalties for uncertain or edge-on poses,
+    # while letting a clearly complete strict SOS (or one calibrated-near
+    # complete close at maximum sensitivity) reach the intuitive 100%.  The
+    # sensitivity marker remains deliberately narrow: at most one fingertip
+    # may be just shy of the calibrated margin, and all palm/reliability
+    # safeguards below still apply.
+    clear_complete_marker = bool(
+        screen.get("strict_complete") or screen.get("sensitivity_assisted_complete")
+    )
+    clear_strict_complete = bool(
+        clear_complete_marker
+        and palm_facing_quality >= 0.85
+        and landmark_reliability >= 0.90
+    )
+    if clear_strict_complete:
+        final_confidence = 1.0
+    reading["confidence"] = round(final_confidence, 4)
+    reading["palm_facing_quality"] = round(palm_facing_quality, 4)
+    reading["landmark_reliability"] = round(landmark_reliability, 4)
+    reading["sos_like_close"] = bool(
+        screen.get("sos_like_close")
+        and palm_facing_quality >= 0.40
+        and landmark_reliability >= 0.45
+    )
+    components = dict(screen.get("confidence_components", {}))
+    components.update({
+        "palm_facing": round(palm_facing_quality, 4),
+        "palm_facing_factor": round(palm_facing_factor, 4),
+        "landmark_reliability": round(landmark_reliability, 4),
+        "landmark_reliability_factor": round(landmark_reliability_factor, 4),
+        "clear_complete_marker": clear_complete_marker,
+        "clear_strict_complete": clear_strict_complete,
+        "final_confidence": reading["confidence"],
+    })
+    reading["confidence_components"] = components
     reading["landmark_confidence"] = visibility
     reading["world_landmarks_available"] = world_landmarks is not None and len(world_landmarks) >= 21
     reading["world_geometry"] = None if world is None else {
@@ -1004,6 +1568,7 @@ def combine_hand_readings(
         "thumb_ip_angle_deg": world.get("thumb_ip_angle_deg"),
         "extended_count": world.get("extended_count"),
         "curled_count": world.get("curled_count"),
+        "palm_facing_quality": world.get("palm_facing_quality"),
         "landmark_confidence": world.get("landmark_confidence"),
     }
     return reading
@@ -1085,6 +1650,7 @@ def analyze_world_hand(
         if name in enabled_fingers
     ) / selected_count
     confidence = max(0.0, min(1.0, 0.45 * curled_fraction + 0.30 * thumb_quality + 0.25 * curled_angle_quality))
+    palm_facing_quality = _world_palm_facing_quality(points)
 
     return {
         "is_open": is_open,
@@ -1099,6 +1665,7 @@ def analyze_world_hand(
         "curled_count": curled_count,
         "required_finger_count": selected_count,
         "finger_metrics": finger_metrics,
+        "palm_facing_quality": None if palm_facing_quality is None else round(palm_facing_quality, 4),
         "landmark_confidence": visibility,
     }
 
@@ -1151,9 +1718,15 @@ class SignalStateMachine:
         if self.state == self.WAITING_CLOSE:
             # This is the group's complete-fist rule: all selected fingers
             # curled below their MCPs and the thumb tucked near the palm.
-            # Requiring consecutive readings is the one conservative
-            # refinement: jitter cannot add up to a false confirmation.
-            if reading["is_closed"] and not reading["is_open"]:
+            # A close must also satisfy the operator-configured quality
+            # threshold.  Requiring consecutive qualified readings is the
+            # conservative refinement: jitter cannot add up to a false
+            # confirmation.
+            if (
+                reading["is_closed"]
+                and not reading["is_open"]
+                and float(reading.get("confidence", 0.0)) >= float(config["confidence_threshold"])
+            ):
                 self.close_streak += 1
             else:
                 self.close_streak = 0
@@ -1163,13 +1736,135 @@ class SignalStateMachine:
         return False, self.state
 
 
+class RepeatedHandsignTracker:
+    """Recognize a second same-hand SOS-like open-to-tuck movement.
+
+    This companion tracker remembers independently completed, qualifying
+    open-to-near-close movements in a short same-hand window.  A new repeated
+    cycle may raise its *effective* score to the configured repeat target;
+    the camera worker still applies the global final confidence threshold
+    before it creates a ``Repeated handsign`` event.
+    """
+
+    WATCHING_OPEN = "WATCHING_OPEN"
+    WATCHING_CLOSE = "WATCHING_CLOSE"
+
+    def __init__(self) -> None:
+        self.state = self.WATCHING_OPEN
+        self.open_streak = 0
+        self.open_started_at: Optional[float] = None
+        self.cycle_times: Deque[float] = deque()
+
+    def reset(self) -> None:
+        self.state = self.WATCHING_OPEN
+        self.open_streak = 0
+        self.open_started_at = None
+        self.cycle_times.clear()
+
+    def _reset_phase(self) -> None:
+        self.state = self.WATCHING_OPEN
+        self.open_streak = 0
+        self.open_started_at = None
+
+    def _discard_expired_cycles(self, now: float, config: Dict[str, Any]) -> None:
+        minimum_time = now - float(config["repeated_handsign_window_sec"])
+        while self.cycle_times and self.cycle_times[0] < minimum_time:
+            self.cycle_times.popleft()
+
+    def _snapshot(
+        self,
+        config: Dict[str, Any],
+        reading: Optional[Dict[str, Any]] = None,
+        new_cycle: bool = False,
+        newly_repeated: bool = False,
+    ) -> Dict[str, Any]:
+        policy = repeated_handsign_policy(config)
+        cycle_count = len(self.cycle_times)
+        raw_confidence = _unit_interval(float((reading or {}).get("confidence", 0.0)))
+        qualifying_reading = bool(
+            reading
+            and reading.get("sos_like_close")
+            and raw_confidence >= policy["minimum_confidence"]
+        )
+        is_repeated = cycle_count >= int(config["repeated_handsign_min_cycles"])
+        # Escalation is edge-triggered by a new second-or-later cycle.  Keeping
+        # it edge-triggered prevents stationary close frames from repeatedly
+        # generating confidence bumps or duplicate incidents.
+        escalation_ready = bool(is_repeated and new_cycle and qualifying_reading)
+        effective_confidence = (
+            max(raw_confidence, policy["confidence_target"])
+            if escalation_ready
+            else raw_confidence
+        )
+        return {
+            "state": self.state,
+            "cycle_count": cycle_count,
+            "latest_cycle_at": self.cycle_times[-1] if self.cycle_times else None,
+            "minimum_cycles": int(config["repeated_handsign_min_cycles"]),
+            "window_sec": float(config["repeated_handsign_window_sec"]),
+            "is_repeated": is_repeated,
+            "minimum_confidence": round(policy["minimum_confidence"], 4),
+            "target_confidence": round(policy["confidence_target"], 4),
+            "raw_confidence": round(raw_confidence, 4),
+            "effective_confidence": round(_unit_interval(effective_confidence), 4),
+            "qualifying_reading": qualifying_reading,
+            "escalation_ready": escalation_ready,
+            "new_cycle": new_cycle,
+            "newly_repeated": newly_repeated,
+        }
+
+    def update(
+        self,
+        reading: Optional[Dict[str, Any]],
+        now: float,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        self._discard_expired_cycles(now, config)
+        if reading is None:
+            return self._snapshot(config, reading)
+
+        if self.state == self.WATCHING_OPEN:
+            self.open_streak = self.open_streak + 1 if reading.get("is_open") else 0
+            if self.open_streak >= int(config["open_hold_frames"]):
+                self.state = self.WATCHING_CLOSE
+                self.open_started_at = now
+            return self._snapshot(config, reading)
+
+        if self.open_started_at is None or now - self.open_started_at > float(config["sequence_max_duration_sec"]):
+            self._reset_phase()
+            # Treat a current open reading as the first frame of a fresh
+            # possible cycle instead of requiring the user to reopen again.
+            if reading.get("is_open"):
+                self.open_streak = 1
+            return self._snapshot(config, reading)
+
+        policy = repeated_handsign_policy(config)
+        raw_confidence = _unit_interval(float(reading.get("confidence", 0.0)))
+        if not reading.get("sos_like_close") or raw_confidence < policy["minimum_confidence"]:
+            return self._snapshot(config, reading)
+
+        was_repeated = len(self.cycle_times) >= int(config["repeated_handsign_min_cycles"])
+        self.cycle_times.append(now)
+        self._discard_expired_cycles(now, config)
+        is_repeated = len(self.cycle_times) >= int(config["repeated_handsign_min_cycles"])
+        self._reset_phase()
+        return self._snapshot(
+            config,
+            reading,
+            new_cycle=True,
+            newly_repeated=(not was_repeated and is_repeated),
+        )
+
+
 @dataclass
 class HandTrack:
     track_id: int
     state_machine: SignalStateMachine = field(default_factory=SignalStateMachine)
+    repetition_tracker: RepeatedHandsignTracker = field(default_factory=RepeatedHandsignTracker)
     last_pos: Optional[Tuple[float, float]] = None
     last_seen_at: Optional[float] = None
     last_trigger_at: float = 0.0
+    last_repeated_cycle_alerted_at: float = 0.0
 
 
 class MultiHandTracker:
@@ -1182,6 +1877,8 @@ class MultiHandTracker:
     def clear_sequence_state(self) -> None:
         for track in self.tracks.values():
             track.state_machine.reset()
+            track.repetition_tracker.reset()
+            track.last_repeated_cycle_alerted_at = 0.0
 
     def update(
         self,
@@ -1233,6 +1930,11 @@ class MultiHandTracker:
             world_hand = world_hands[hand_index] if hand_index < len(world_hands) else None
             reading = combine_hand_readings(screen_hand, world_hand, config)
             confirmed, state = track.state_machine.update(reading, now, config)
+            repetition = track.repetition_tracker.update(reading, now, config)
+            raw_confidence = _unit_interval(float((reading or {}).get("confidence", 0.0)))
+            effective_confidence = _unit_interval(
+                float(repetition.get("effective_confidence", raw_confidence))
+            )
             outputs.append({
                 "track": track,
                 "track_id": track_id,
@@ -1242,12 +1944,20 @@ class MultiHandTracker:
                 "reading": reading,
                 "confirmed": confirmed,
                 "state": state,
+                "repetition": repetition,
+                # Keep the calibrated visual score intact in `reading`; these
+                # event-level values make a repeat target observable without
+                # implying that it silently changed raw landmark confidence.
+                "raw_confidence": round(raw_confidence, 4),
+                "effective_confidence": round(effective_confidence, 4),
+                "repeat_escalation_ready": bool(repetition.get("escalation_ready")),
             })
 
         for track_id, track in list(self.tracks.items()):
             if track_id in seen_track_ids:
                 continue
             track.state_machine.update(None, now, config)
+            track.repetition_tracker.update(None, now, config)
             if track.last_seen_at is not None and now - track.last_seen_at > config["hand_track_stale_sec"]:
                 del self.tracks[track_id]
         return outputs
@@ -1312,7 +2022,7 @@ class PeopleDetector:
     _LABEL = "opencv_hog_face_validated_with_haar_face_fallback"
     _UNAVAILABLE_LABEL = "opencv_haar_face_validation_unavailable"
 
-    def __init__(self) -> None:
+    def __init__(self, start_worker: bool = True) -> None:
         self._hog = cv2.HOGDescriptor()
         self._hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
         cascade_dir = getattr(getattr(cv2, "data", None), "haarcascades", "")
@@ -1339,8 +2049,12 @@ class PeopleDetector:
         self._latest_at = 0.0
         self._next_track_id = 1
         self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="senyalert-people-face-validated", daemon=True)
-        self._thread.start()
+        self._thread: Optional[threading.Thread] = None
+        if start_worker:
+            self._thread = threading.Thread(
+                target=self._run, name="senyalert-people-face-validated", daemon=True
+            )
+            self._thread.start()
 
     def submit(self, frame: Any, now: float, max_width: int) -> None:
         task = (frame.copy(), now, max_width)
@@ -1371,7 +2085,18 @@ class PeopleDetector:
 
     def stop(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=1.5)
+        if self._thread is not None:
+            self._thread.join(timeout=1.5)
+
+    def detect_now(self, frame: Any, now: float, max_width: int) -> List[PersonBox]:
+        """Run one synchronous people pass for repeatable local profiling.
+
+        Production workers use :meth:`submit` and keep this detector off the
+        camera thread. Benchmark code can instantiate ``PeopleDetector`` with
+        ``start_worker=False`` and time the identical detector path without a
+        scheduling delay or hidden queue backlog.
+        """
+        return self._detect(frame, now, max_width)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -1577,8 +2302,21 @@ def hand_landmark_bounds(screen_landmarks: Sequence[Any]) -> Dict[str, float]:
     }
 
 
-def alert_context(people: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
-    count = int(people["count"])
+def alert_context(
+    people: Dict[str, Any], config: Dict[str, Any], signaler_people_floor: int = 0
+) -> Dict[str, Any]:
+    """Build one camera-local triage decision from an occupancy observation.
+
+    The face-validated detector intentionally fails closed when a face is not
+    visible.  A confirmed SOS hand, however, is direct evidence that at least
+    one person is in that camera's view.  Preserve the detector's count for
+    diagnostics but use that proven lower bound for alert triage so a
+    single-person quiet threshold behaves the same on a portrait phone stream
+    as it does on a frontal laptop view.
+    """
+    detected_count = max(0, int(people.get("count", 0)))
+    signaler_people_floor = max(0, int(signaler_people_floor))
+    count = max(detected_count, signaler_people_floor)
     threshold = int(config["quiet_at_or_above_people"])
     people_detection_enabled = bool(config["people_detection_enabled"])
     audible_alerts_enabled = bool(config["audible_alerts_enabled"])
@@ -1606,6 +2344,13 @@ def alert_context(people: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, A
         "audible_alerts_enabled": audible_alerts_enabled,
         "alert_reason": reason,
         "people_count": count,
+        "detected_people_count": detected_count,
+        "signaler_people_floor": signaler_people_floor,
+        "people_count_source": (
+            "FACE_VALIDATED_WITH_CONFIRMED_SIGNALER_FLOOR"
+            if signaler_people_floor > detected_count
+            else "FACE_VALIDATED"
+        ),
         "people_count_stale": occupancy_stale,
         "occupancy_status": "DISABLED" if not people_detection_enabled else "STALE" if occupancy_stale else "CURRENT",
     }
@@ -1628,8 +2373,13 @@ class ActiveRecording:
 class EvidenceRecorder:
     """Time-based pre-event ring buffer and concurrent post-event MP4 writers."""
 
-    def __init__(self, complete_callback: Callable[[ActiveRecording, str], None]) -> None:
+    def __init__(
+        self,
+        complete_callback: Callable[[ActiveRecording, str], None],
+        evidence_directory: Path = RECORDED_EVIDENCE_DIR / "CAM-UNKNOWN" / "videos",
+    ) -> None:
         self._complete_callback = complete_callback
+        self._evidence_directory = Path(evidence_directory).resolve()
         self._buffer: Deque[Tuple[float, Any]] = deque()
         self._last_buffer_sample_at = 0.0
         self._active: Dict[str, ActiveRecording] = {}
@@ -1674,7 +2424,11 @@ class EvidenceRecorder:
     ) -> Tuple[str, bool, Optional[str]]:
         # Keep the project's existing incident_<timestamp>.mp4 convention while
         # adding a collision-resistant event token for two simultaneous hands.
-        video_path = str(PROJECT_ROOT / f"incident_{event_token}.mp4")
+        try:
+            self._evidence_directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return str(self._evidence_directory / f"incident_{event_token}.mp4"), False, f"Evidence directory is unavailable: {exc}"
+        video_path = str(self._evidence_directory / f"incident_{event_token}.mp4")
         width, height = frame.shape[1], frame.shape[0]
         fps = float(config["recording_fps"])
         writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
@@ -1725,11 +2479,14 @@ class EvidenceRecorder:
                 self._complete_callback(recording, status)
 
 
-def save_snapshot(frame: Any, event_token: str) -> Tuple[Optional[str], Optional[str]]:
+def save_snapshot(
+    frame: Any, event_token: str, output_directory: Path = SNAPSHOT_DIR
+) -> Tuple[Optional[str], Optional[str]]:
     """Persist a JPEG snapshot without any automatic cleanup or retention policy."""
     try:
-        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-        snapshot_path = SNAPSHOT_DIR / f"snapshot_{event_token}.jpg"
+        output_directory = Path(output_directory).resolve()
+        output_directory.mkdir(parents=True, exist_ok=True)
+        snapshot_path = output_directory / f"snapshot_{event_token}.jpg"
         if cv2.imwrite(str(snapshot_path), frame):
             return str(snapshot_path.resolve()), None
         return None, "OpenCV could not write the JPEG snapshot"
@@ -1943,6 +2700,16 @@ class LatestFrameCapture:
         self._latest_frame: Optional[Any] = None
         self._latest_sequence = 0
         self._delivered_sequence = 0
+        # These are intentionally capture-adapter counters rather than
+        # detector counters.  They make a network-camera benchmark able to
+        # report how many decoded MJPEG/RTSP frames were deliberately
+        # superseded before vision consumed them.  Dropping those frames is
+        # the low-latency behaviour, not an error condition.
+        self._captured_frames = 0
+        self._delivered_frames = 0
+        self._dropped_stale_frames = 0
+        self._last_frame_received_ns: Optional[int] = None
+        self._last_frame_delivered_ns: Optional[int] = None
         self._last_error = ""
         self._reader = threading.Thread(
             target=self._reader_loop,
@@ -1959,6 +2726,29 @@ class LatestFrameCapture:
     def isOpened(self) -> bool:
         with self._condition:
             return not self._released and bool(self._capture.isOpened())
+
+    def metrics_snapshot(self) -> Dict[str, Any]:
+        """Return bounded-queue telemetry for local benchmark tooling.
+
+        ``dropped_stale_frames`` is the number of decoded network frames that
+        were replaced in the one-frame slot before a consumer requested them.
+        It must not be interpreted as a transport loss rate: the camera may
+        have delivered every frame successfully, but the vision worker chose
+        the newest one to avoid acting on old video.
+        """
+        with self._condition:
+            now_ns = time.perf_counter_ns()
+            age_ms: Optional[float] = None
+            if self._last_frame_received_ns is not None:
+                age_ms = round((now_ns - self._last_frame_received_ns) / 1_000_000.0, 3)
+            return {
+                "capture_adapter": "latest_frame",
+                "captured_frames": self._captured_frames,
+                "delivered_frames": self._delivered_frames,
+                "dropped_stale_frames": self._dropped_stale_frames,
+                "latest_frame_age_ms": age_ms,
+                "last_error": self._last_error,
+            }
 
     def _reader_loop(self) -> None:
         while True:
@@ -1990,8 +2780,12 @@ class LatestFrameCapture:
                 # Assignment replaces the previous frame atomically while the
                 # lock is held.  A stalled detector therefore cannot make this
                 # queue grow beyond one decoded frame.
+                if self._latest_sequence > self._delivered_sequence:
+                    self._dropped_stale_frames += 1
                 self._latest_frame = frame
                 self._latest_sequence += 1
+                self._captured_frames += 1
+                self._last_frame_received_ns = time.perf_counter_ns()
                 self._last_error = ""
                 self._condition.notify_all()
 
@@ -2020,6 +2814,8 @@ class LatestFrameCapture:
             # The reader immediately asks OpenCV for another frame after it
             # leaves the lock.  A defensive copy makes the consumer independent
             # of an OpenCV backend that reuses its decode buffer.
+            self._delivered_frames += 1
+            self._last_frame_delivered_ns = time.perf_counter_ns()
             return True, self._latest_frame.copy()
 
     def get(self, property_id: int) -> float:
@@ -2206,14 +3002,31 @@ def draw_preview(
     camera_name = clipped(str(config.get("camera_id", "CAMERA")), 32)
     camera_x = max(width // 2, width - max(px(230), len(camera_name) * px(9)))
     text(camera_name, (camera_x, px(28)), 0.46, white, 1)
-    text("PAUSED" if paused else "LIVE", (camera_x, px(50)), 0.36, online_color, 1)
+    gesture_sensitivity = _gesture_sensitivity(config)
+    live_state = "PAUSED" if paused else f"LIVE · SENS {gesture_sensitivity:.0%}"
+    text(live_state, (camera_x, px(50)), 0.36, online_color, 1)
 
-    people_value = str(people["count"]) + (" pending" if people["stale"] else " seen")
+    detected_people = max(0, int(people.get("count", 0)))
+    effective_people = detected_people
+    if context is not None:
+        effective_people = max(detected_people, int(context.get("people_count", detected_people)))
+    # A confirmed SOS hand is trustworthy evidence that at least its signaler
+    # is in this camera's view, even if a portrait/side-on face cannot pass
+    # the deliberately strict face-validated occupancy detector.  Make that
+    # lower bound explicit in the HUD so an operator does not mistake it for
+    # a face-detector count.
+    if effective_people > detected_people:
+        people_value = f"{effective_people} min · detector {detected_people}"
+    else:
+        people_value = str(detected_people) + (" pending" if people["stale"] else " seen")
     metric_card(0, "OCCUPANCY", people_value, cyan if not people["stale"] else amber)
     metric_card(1, "HANDS", f"{len(hand_results)} / {config['max_hands']}", blue)
     if context:
         alert_accent = amber if context["alert_mode"] == "QUIET" else red
         metric_card(2, "NEXT ALERT", context["alert_mode"], alert_accent)
+
+    footer_height = px(42)
+    footer_top = height - footer_height
 
     for person in people["transient_tracks"]:
         box = person["box"]
@@ -2229,7 +3042,11 @@ def draw_preview(
         text(label, (x + px(6), label_top + px(15)), 0.36, cyan, 1)
 
     for result in hand_results:
-        color = green if result["state"] in {SignalStateMachine.WAITING_CLOSE, "CONFIRMED"} else amber
+        repetition = result.get("repetition") or {}
+        is_repeated = bool(repetition.get("is_repeated"))
+        color = green if (
+            result["state"] in {SignalStateMachine.WAITING_CLOSE, "CONFIRMED"} or is_repeated
+        ) else amber
         landmarks = result["screen_landmarks"]
         for first, second in (
             (0, 1), (1, 2), (2, 3), (3, 4),
@@ -2263,11 +3080,26 @@ def draw_preview(
             )
         wrist = landmarks[0]
         reading = result["reading"]
+        raw_confidence = _unit_interval(float(result.get("raw_confidence", (reading or {}).get("confidence", 0.0))))
+        effective_confidence = _unit_interval(
+            float(result.get("effective_confidence", raw_confidence))
+        )
         hand_x = content_left + int(wrist.x * content_width)
         hand_y = content_top + int(wrist.y * content_height)
-        label = f"HAND {result['track_id']}  {result['state']}"
+        state_label = "REPEATED" if is_repeated else result["state"]
+        label = f"HAND {result['track_id']}  {state_label}"
         if reading is None:
             detail = "landmarks not scorable"
+        elif is_repeated:
+            confidence_transition = (
+                f"{raw_confidence:.0%}→{effective_confidence:.0%}"
+                if effective_confidence > raw_confidence + 1e-6
+                else f"{raw_confidence:.0%}"
+            )
+            detail = (
+                f"Repeat {repetition.get('cycle_count', 0)}/"
+                f"{repetition.get('minimum_cycles', 2)} · {confidence_transition}"
+            )
         else:
             detail = (
                 f"open {int(reading['is_open'])} · closed {int(reading['is_closed'])}"
@@ -2278,8 +3110,48 @@ def draw_preview(
         text(label, (hand_x + px(8), label_top + px(17)), 0.38, color, 1)
         text(clipped(detail, 36), (hand_x + px(8), label_top + px(35)), 0.32, white, 1)
 
-    footer_height = px(42)
-    footer_top = height - footer_height
+        # Pin the calibrated per-hand score to the index MCP (landmark 5),
+        # rather than adding another global metric card.  It stays readable
+        # when multiple hands are in frame and directly explains why a close
+        # does or does not meet the configured confidence threshold.
+        index_base = landmarks[5] if len(landmarks) > 5 else wrist
+        confidence_x = content_left + int(index_base.x * content_width)
+        confidence_y = content_top + int(index_base.y * content_height)
+        if reading is None:
+            confidence_label = "CONF —"
+            confidence_color = muted
+        else:
+            confidence_value = effective_confidence
+            if effective_confidence > raw_confidence + 1e-6:
+                confidence_label = f"CONF {raw_confidence:.0%}→{effective_confidence:.0%}"
+            else:
+                confidence_label = f"CONF {confidence_value:.0%}"
+            confidence_color = (
+                green
+                if reading.get("is_closed") and confidence_value >= float(config["confidence_threshold"])
+                else amber
+            )
+        confidence_text_width = cv2.getTextSize(
+            confidence_label, cv2.FONT_HERSHEY_SIMPLEX, 0.34 * ui_scale, px(1)
+        )[0][0]
+        confidence_left = min(
+            width - confidence_text_width - px(12),
+            max(px(4), confidence_x + px(10)),
+        )
+        confidence_top = min(
+            footer_top - px(24),
+            max(card_top + card_height + px(8), confidence_y - px(24)),
+        )
+        glass_rect(
+            confidence_left - px(5),
+            confidence_top - px(15),
+            confidence_left + confidence_text_width + px(6),
+            confidence_top + px(5),
+            navy,
+            0.86,
+        )
+        text(confidence_label, (confidence_left, confidence_top), 0.34, confidence_color, 1)
+
     glass_rect(0, footer_top, width, height, navy, 0.84)
     if paused:
         footer = "Detection paused — camera preview remains visible"
@@ -2288,10 +3160,50 @@ def draw_preview(
         footer = hand_status
         footer_color = amber
     else:
-        footer = "Hand tracking active · ESC closes the multi-camera preview"
+        repeat_policy = repeated_handsign_policy(config)
+        footer = (
+            f"Hand tracking · SENS {gesture_sensitivity:.0%} · "
+            f"repeat ≥{repeat_policy['minimum_confidence']:.0%}→"
+            f"{repeat_policy['confidence_target']:.0%}/{float(config['repeated_handsign_window_sec']):.0f}s · ESC closes preview"
+        )
         footer_color = green
     text(clipped(footer, 120), (margin, height - px(14)), 0.42, footer_color, 1)
     return preview
+
+
+# ---------------------------------------------------------------------------
+# Modular vision/HUD boundary
+# ---------------------------------------------------------------------------
+# The original launcher remains intentionally compatible with the dashboard,
+# benchmark scripts, and classroom run command.  Its runtime orchestration is
+# staged separately, while all live gesture decisions and all preview drawing
+# now come from independently testable modules.  Assigning these names before
+# CameraWorker is defined means each worker uses the modular implementation;
+# the legacy in-file definitions above are retained only for compatibility with
+# older local imports during this transition.
+from senyalert_engine.gesture import (  # noqa: E402
+    HandTrack as _ModularHandTrack,
+    MultiHandTracker as _ModularMultiHandTracker,
+    RepeatedHandsignTracker as _ModularRepeatedHandsignTracker,
+    SignalStateMachine as _ModularSignalStateMachine,
+    analyze_screen_hand as _modular_analyze_screen_hand,
+    analyze_world_hand as _modular_analyze_world_hand,
+    combine_hand_readings as _modular_combine_hand_readings,
+    effective_thresholds as _modular_effective_thresholds,
+    landmark_confidence_status as _modular_landmark_confidence_status,
+)
+from senyalert_engine.hud import draw_preview as _modular_draw_preview  # noqa: E402
+
+HandTrack = _ModularHandTrack
+MultiHandTracker = _ModularMultiHandTracker
+RepeatedHandsignTracker = _ModularRepeatedHandsignTracker
+SignalStateMachine = _ModularSignalStateMachine
+analyze_screen_hand = _modular_analyze_screen_hand
+analyze_world_hand = _modular_analyze_world_hand
+combine_hand_readings = _modular_combine_hand_readings
+effective_thresholds = _modular_effective_thresholds
+landmark_confidence_status = _modular_landmark_confidence_status
+draw_preview = _modular_draw_preview
 
 
 class CameraWorker:
@@ -2300,6 +3212,19 @@ class CameraWorker:
     def __init__(self, camera: Dict[str, Any], socket: EngineSocketClient) -> None:
         self.camera = copy.deepcopy(camera)
         self.socket = socket
+        self._is_uploaded_video = bool(self.camera.get("uploaded_video"))
+        configured_evidence_directory = self.camera.get("evidence_directory")
+        if configured_evidence_directory:
+            # Uploaded-video jobs supply their own isolated job directory.
+            self._evidence_directory = Path(configured_evidence_directory).resolve()
+        else:
+            # Live cameras always receive their own future-facing evidence
+            # folder; do not relocate legacy files already in the project root.
+            self._evidence_directory = (
+                RECORDED_EVIDENCE_DIR / evidence_camera_directory_name(self.camera.get("camera_id"))
+            ).resolve()
+        self._video_evidence_directory = self._evidence_directory / "videos"
+        self._snapshot_evidence_directory = self._evidence_directory / "snapshots"
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self.run,
@@ -2311,7 +3236,7 @@ class CameraWorker:
         self._last_preview_sent_at = 0.0
         self.tracker = MultiHandTracker()
         self.people_detector = PeopleDetector()
-        self.recorder = EvidenceRecorder(self._on_media_complete)
+        self.recorder = EvidenceRecorder(self._on_media_complete, self._video_evidence_directory)
         self.detector: Optional[Any] = None
         self.image_fallback_detector: Optional[Any] = None
         self.capture: Optional[Any] = None
@@ -2329,6 +3254,12 @@ class CameraWorker:
         self._hand_status = "Waiting for MediaPipe hand landmarks"
         self._last_hand_debug: Dict[int, Tuple[Any, ...]] = {}
         self._actual_capture_dimensions: Tuple[int, int] = (0, 0)
+        self._offline_started_at = time.monotonic()
+        self._offline_source_fps = 0.0
+        self._offline_total_frames = 0
+        self._completed_source = False
+        self._offline_detection_count = 0
+        self._offline_failure_detail = ""
 
     @property
     def camera_id(self) -> str:
@@ -2373,10 +3304,69 @@ class CameraWorker:
             "processing_scale",
             "resolution",
             "preview_resolution",
+            "archive_source",
+            "upload_job_id",
+            "source_video_path",
+            "uploaded_video",
+            "evidence_directory",
         ):
             if key in self.camera:
                 config[key] = copy.deepcopy(self.camera[key])
+        # A queued demonstration video must run even if the operator pauses
+        # live cameras while reviewing the dashboard.
+        if self._is_uploaded_video:
+            config["paused"] = False
         return config
+
+    def _timeline_now(self) -> float:
+        """Use source-frame time for offline evidence and gesture durations."""
+        if not self._is_uploaded_video:
+            return time.monotonic()
+        if self._offline_source_fps <= 0.0 and self.capture is not None:
+            try:
+                candidate = float(self.capture.get(cv2.CAP_PROP_FPS))
+            except Exception:
+                candidate = 0.0
+            self._offline_source_fps = candidate if math.isfinite(candidate) and candidate >= 1.0 else 30.0
+            try:
+                self._offline_total_frames = max(0, int(self.capture.get(cv2.CAP_PROP_FRAME_COUNT)))
+            except Exception:
+                self._offline_total_frames = 0
+        return self._offline_started_at + max(0, self._frame_count - 1) / max(1.0, self._offline_source_fps)
+
+    def _send_uploaded_video_status(
+        self,
+        stage: str,
+        config: Dict[str, Any],
+        detail: str,
+        *,
+        processed_frames: Optional[int] = None,
+        total_frames: Optional[int] = None,
+        reliable: bool = False,
+    ) -> None:
+        """Publish a compact, job-scoped offline-analysis lifecycle update."""
+        if not self._is_uploaded_video:
+            return
+        source_path = str(config.get("source_video_path", ""))
+        source_name = Path(source_path).name if source_path else "video"
+        payload = {
+            "event": "UPLOADED_VIDEO_STATUS",
+            "archive_source": "UPLOADED",
+            "upload_job_id": config.get("upload_job_id", ""),
+            "cameraId": config.get("camera_id", ""),
+            "source_name": source_name,
+            "stage": stage,
+            "detail": detail,
+            "processed_frames": max(0, self._frame_count if processed_frames is None else processed_frames),
+            "total_frames": max(0, self._offline_total_frames if total_frames is None else total_frames),
+            "detected_incidents": max(0, self._offline_detection_count),
+        }
+        # Progress is replaceable. Do not let a long disconnected scan crowd
+        # reliable incident/media events out of the socket's reconnect queue.
+        if reliable:
+            self.socket.send(payload)
+        else:
+            self.socket.send_volatile(payload)
 
     def _publish_preview(self, preview: Any, config: Dict[str, Any], now: float) -> None:
         with self._preview_lock:
@@ -2438,6 +3428,9 @@ class CameraWorker:
             "input_kind": camera_input_kind(config["camera_source"]),
             "timestamp": int(time.time()),
         }
+        if config.get("archive_source") == "UPLOADED":
+            payload["archive_source"] = "UPLOADED"
+            payload["upload_job_id"] = config.get("upload_job_id", "")
         dimensions = actual_dimensions or self._actual_capture_dimensions
         if dimensions[0] > 0 and dimensions[1] > 0:
             payload["capture_width"] = dimensions[0]
@@ -2457,7 +3450,12 @@ class CameraWorker:
         profile = profile_for_camera_type(config.get("camera_type"))
         source_kind = camera_input_kind(config["camera_source"])
         aspect = display_aspect_ratio(*dimensions)
-        if source_kind == "ADB screen-capture fallback":
+        if self._is_uploaded_video:
+            detail = (
+                f"Uploaded video frame is {width}x{height} ({aspect}); "
+                "the same offline detection pipeline is running."
+            )
+        elif source_kind == "ADB screen-capture fallback":
             detail = (
                 f"ADB screen-capture fallback frame is {width}x{height} ({aspect}); "
                 "it is not raw phone-camera access. Keep the stock Camera app foreground."
@@ -2509,6 +3507,8 @@ class CameraWorker:
             self._applied_detector_key = None
             self._failed_detector_key = key
             self._next_detector_retry_at = time.monotonic() + 5.0
+            if self._is_uploaded_video:
+                self._offline_failure_detail = f"The hand landmark detector could not start: {exc}"
             self.socket.send({"event": "ENGINE_STATUS", "status": "HAND_TRACKER_ERROR", "detail": str(exc)})
             print(f"[ENGINE] Hand tracker unavailable: {exc}")
             return False
@@ -2615,17 +3615,26 @@ class CameraWorker:
         self._last_hand_results = []
         self._actual_capture_dimensions = (0, 0)
         self._send_camera_status("CONNECTING", config)
+        if self._is_uploaded_video:
+            self._send_uploaded_video_status(
+                "OPENING", config, "Opening the selected local video for offline analysis.", processed_frames=0)
         try:
             self.capture = open_camera(config["camera_source"], config)
         except CameraSourceError as exc:
             self.capture = None
+            if self._is_uploaded_video:
+                self._offline_failure_detail = f"The selected video could not be opened: {exc}"
             self._send_camera_status("ERROR", config, str(exc))
             return False
         if self.capture is None:
+            if self._is_uploaded_video:
+                self._offline_failure_detail = (
+                    "OpenCV could not open the selected local video. Confirm that it is a supported, readable video file."
+                )
             self._send_camera_status(
                 "ERROR",
                 config,
-                "OpenCV could not open this webcam index, UVC/raw USB input, or stream URL",
+                "OpenCV could not open this webcam index, UVC/raw USB input, stream URL, or local uploaded video",
             )
             return False
         if isinstance(self.capture, AdbScreenCapture):
@@ -2636,7 +3645,14 @@ class CameraWorker:
             )
             return True
         source_kind = camera_input_kind(config["camera_source"])
-        if is_network_stream_source(config["camera_source"]):
+        if self._is_uploaded_video:
+            # Read source metadata before the first progress update. Some
+            # codecs do not expose a frame count, in which case Swing shows an
+            # honest indeterminate progress bar instead of inventing a percent.
+            self._timeline_now()
+            detail = "Uploaded video opened; processing frames with the current detection settings."
+            self._send_uploaded_video_status("PROCESSING", config, detail, processed_frames=0)
+        elif is_network_stream_source(config["camera_source"]):
             detail = (
                 f"{source_kind} opened with newest-frame delivery; "
                 "waiting for the first decoded frame to report actual dimensions."
@@ -2648,9 +3664,10 @@ class CameraWorker:
 
     def _on_media_complete(self, recording: ActiveRecording, status: str) -> None:
         payload = copy.deepcopy(recording.metadata)
+        completed_at = self._timeline_now() if self._is_uploaded_video else time.monotonic()
         recorded_post_seconds = min(
             recording.end_at - recording.started_at,
-            max(0.0, time.monotonic() - recording.started_at),
+            max(0.0, completed_at - recording.started_at),
         )
         video_duration_sec = round(recording.pre_event_seconds_recorded + recorded_post_seconds, 2)
         payload.update({
@@ -2681,10 +3698,21 @@ class CameraWorker:
         now: float,
     ) -> None:
         reading = result["reading"] or {}
+        repetition = dict(result.get("repetition") or {})
+        raw_confidence = _unit_interval(float(result.get("raw_confidence", reading.get("confidence", 0.0))))
+        effective_confidence = _unit_interval(
+            float(result.get("effective_confidence", raw_confidence))
+        )
+        incident_type = "Repeated handsign" if repetition.get("is_repeated") else "SOS handsign"
         event_token = f"evt-{dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}-{uuid.uuid4().hex[:8]}"
-        snapshot_path, snapshot_error = save_snapshot(frame, event_token)
+        snapshot_path, snapshot_error = save_snapshot(
+            frame, event_token, self._snapshot_evidence_directory
+        )
         person = associate_hand_to_person(result["screen_landmarks"], people)
-        context = alert_context(people, config)
+        # A confirmed gesture is also a confirmed person in this camera's
+        # view.  It only raises an otherwise under-counted zero to one; it
+        # never inflates a face-validated multi-person count.
+        context = alert_context(people, config, signaler_people_floor=1)
         hand_count = len(result.get("all_hand_results", []))
         # Prefer the associated occupancy track when available. It is still
         # camera-local and transient - never an identity - but it lets the
@@ -2695,7 +3723,19 @@ class CameraWorker:
             "event_token": event_token,
             "cameraId": config["camera_id"],
             "camera_source": display_camera_source(config["camera_source"]),
-            "confidence": round(float(reading.get("confidence", 0.0)), 3),
+            "archive_source": config.get("archive_source", "RECORDED"),
+            "upload_job_id": config.get("upload_job_id", ""),
+            "source_video_path": config.get("source_video_path", ""),
+            # `confidence` is the score that passed the final global gate.
+            # Preserve its calibrated/raw counterpart so a configured repeated
+            # escalation remains auditable in the dashboard payload.
+            "confidence": round(effective_confidence, 3),
+            "raw_confidence": round(raw_confidence, 3),
+            "effective_confidence": round(effective_confidence, 3),
+            "repeat_confidence_escalated": bool(result.get("repeat_escalation_ready")),
+            # The exact value is intentionally stable for archive filtering,
+            # reporting, and Chapter 4/5 result exports.
+            "incident_type": incident_type,
             "timestamp": int(time.time()),
             "timestamp_readable": dt.datetime.now().isoformat(timespec="seconds"),
             "location": config["location"],
@@ -2707,6 +3747,9 @@ class CameraWorker:
             "alert_reason": context["alert_reason"],
             "people_count_stale": context["people_count_stale"],
             "occupancy_status": context["occupancy_status"],
+            "detected_people_count": context["detected_people_count"],
+            "signaler_people_floor": context["signaler_people_floor"],
+            "people_count_source": context["people_count_source"],
             "snapshot_path": snapshot_path,
             "snapshot_mime_type": "image/jpeg",
             "snapshot_error": snapshot_error,
@@ -2728,8 +3771,15 @@ class CameraWorker:
             "signal_hand": {
                 "track_id": result["track_id"],
                 "gesture_state": result["state"],
+                "incident_type": incident_type,
+                "repetition": repetition,
+                "raw_confidence": round(raw_confidence, 4),
+                "effective_confidence": round(effective_confidence, 4),
+                "repeat_confidence_escalated": bool(result.get("repeat_escalation_ready")),
                 "world_landmarks_used": bool(result["world_landmarks_available"]),
                 "landmark_confidence": reading.get("landmark_confidence"),
+                "confidence_components": reading.get("confidence_components"),
+                "palm_facing_quality": reading.get("palm_facing_quality"),
                 "geometry": {
                     "thumb_tip_to_palm_ratio": reading.get("thumb_tip_to_palm_ratio"),
                     "thumb_ip_angle_deg": reading.get("thumb_ip_angle_deg"),
@@ -2748,6 +3798,13 @@ class CameraWorker:
         })
         # This is intentionally sent before the post-event clip finishes.
         self.socket.send(immediate_payload)
+        if self._is_uploaded_video:
+            self._offline_detection_count += 1
+            self._send_uploaded_video_status(
+                "DETECTION",
+                config,
+                "A qualifying handsign was detected; saving its snapshot and evidence record to Uploaded Evidence.",
+            )
         if not recording_started:
             ready_payload = copy.deepcopy(base_payload)
             ready_payload.update({
@@ -2762,20 +3819,33 @@ class CameraWorker:
 
     def run(self) -> None:
         next_camera_retry_at = 0.0
+        last_config: Optional[Dict[str, Any]] = None
         try:
             while not self._stop.is_set():
                 global_config, _revision = CONFIG.snapshot()
                 config = self._effective_config(global_config)
+                last_config = config
                 if config["paused"] != self._last_pause_state:
                     self.tracker.clear_sequence_state()
                     self._last_pause_state = config["paused"]
 
                 detector_ready = self._ensure_detector(config)
+                if self._is_uploaded_video and not detector_ready:
+                    if not self._offline_failure_detail:
+                        self._offline_failure_detail = (
+                            "The hand landmark detector is unavailable, so this video cannot be analyzed reliably."
+                        )
+                    break
                 now = time.monotonic()
                 if self.capture is None and now < next_camera_retry_at:
                     self._stop.wait(0.05)
                     continue
                 if not self._ensure_camera(config):
+                    if self._is_uploaded_video:
+                        # A local file that cannot be opened will not become
+                        # readable through retries. End this job visibly rather
+                        # than leaving the upload screen in a false queue state.
+                        break
                     # Do not hammer a phone stream or absent webcam while it
                     # is unavailable; retry after a short, visible backoff.
                     next_camera_retry_at = now + 2.0
@@ -2786,6 +3856,24 @@ class CameraWorker:
                 assert self.capture is not None
                 ok, frame = self.capture.read()
                 if not ok or frame is None:
+                    if self._is_uploaded_video:
+                        processed = self._frame_count
+                        total = self._offline_total_frames
+                        if processed <= 0:
+                            self._offline_failure_detail = (
+                                "The video opened but no frames could be decoded. No Uploaded Evidence record was created."
+                            )
+                            self._send_camera_status("ERROR", config, self._offline_failure_detail)
+                        else:
+                            self._completed_source = True
+                            detail = (
+                                f"Offline video analysis complete: processed {processed} frame(s)"
+                                + (f" of {total}." if total else ".")
+                            )
+                            self._send_camera_status("COMPLETE", config, detail)
+                        self.capture.release()
+                        self.capture = None
+                        break
                     detail = getattr(self.capture, "last_error", "") or "Frame read failed; reconnecting"
                     self._send_camera_status("ERROR", config, detail)
                     self.capture.release()
@@ -2793,8 +3881,19 @@ class CameraWorker:
                     self._applied_camera_input = object()
                     continue
 
-                now = time.monotonic()
                 self._frame_count += 1
+                now = self._timeline_now()
+                if self._is_uploaded_video and self._frame_count % 30 == 0:
+                    total = self._offline_total_frames
+                    detail = (
+                        f"Offline analysis processing frame {self._frame_count}"
+                        + (f" of {total}." if total else ".")
+                    )
+                    # Keep the global header quiet enough for active camera
+                    # diagnostics while still updating the upload tab often.
+                    if self._frame_count % 120 == 0:
+                        self._send_camera_status("PROCESSING", config, detail)
+                    self._send_uploaded_video_status("PROCESSING", config, detail)
                 self._report_actual_capture_dimensions(frame, config)
                 # Capture and evidence remain at the selected camera
                 # resolution.  Only the computer-vision workload may be
@@ -2852,26 +3951,106 @@ class CameraWorker:
                         for result in hand_results:
                             result["all_hand_results"] = hand_results
                             reading = result["reading"]
-                            if not result["confirmed"] or reading is None:
+                            strict_confirmed = bool(result.get("confirmed"))
+                            repeat_escalation_ready = bool(result.get("repeat_escalation_ready"))
+                            if reading is None or not (strict_confirmed or repeat_escalation_ready):
                                 continue
                             track: HandTrack = result["track"]
-                            if now - track.last_trigger_at < config["alert_cooldown_sec"]:
+                            repetition = result.get("repetition") or {}
+                            try:
+                                repeated_cycle_at = float(repetition.get("latest_cycle_at") or 0.0)
+                            except (TypeError, ValueError):
+                                repeated_cycle_at = 0.0
+                            repeated_cycle_ready = bool(repetition.get("is_repeated")) and (
+                                repeated_cycle_at > track.last_repeated_cycle_alerted_at
+                            )
+                            # A low-scoring second near-SOS can use only the
+                            # explicit repeat target captured on its new cycle;
+                            # a normal strict confirmation continues to use
+                            # its untouched raw landmark confidence.
+                            raw_confidence = _unit_interval(float(result.get("raw_confidence", reading["confidence"])))
+                            effective_confidence = (
+                                _unit_interval(float(result.get("effective_confidence", raw_confidence)))
+                                if repeat_escalation_ready
+                                else raw_confidence
+                            )
+                            # Do not create a later strict duplicate for the
+                            # same repeated cycle after that cycle already
+                            # created its one target-escalated incident.
+                            if (
+                                strict_confirmed
+                                and bool(repetition.get("is_repeated"))
+                                and repeated_cycle_at > 0.0
+                                and repeated_cycle_at <= track.last_repeated_cycle_alerted_at
+                            ):
                                 continue
-                            if reading["confidence"] < config["confidence_threshold"]:
+                            # A newly completed repeated same-hand signal is
+                            # an escalation, not duplicate frame noise.  Let it
+                            # create its one labelled event even when the
+                            # ordinary single-gesture cooldown is still active.
+                            if (
+                                not repeated_cycle_ready
+                                and now - track.last_trigger_at < config["alert_cooldown_sec"]
+                            ):
                                 continue
+                            # The configured final threshold remains
+                            # authoritative for both strict and repeated
+                            # paths.  A repeat target is a visible score
+                            # adjustment, never a direct event bypass.
+                            if effective_confidence < float(config["confidence_threshold"]):
+                                continue
+                            result["raw_confidence"] = round(raw_confidence, 4)
+                            result["effective_confidence"] = round(effective_confidence, 4)
                             track.last_trigger_at = now
+                            if repeated_cycle_ready:
+                                track.last_repeated_cycle_alerted_at = repeated_cycle_at
                             self._trigger_alert(frame, result, people, config, now)
                     except Exception as exc:
                         self.socket.send({"event": "ENGINE_STATUS", "status": "HAND_DETECTION_ERROR", "detail": str(exc)})
                         print(f"[ENGINE] Hand detection error: {exc}")
 
-                preview_context = alert_context(people, config)
+                # Keep the HUD policy readout consistent with a later alert:
+                # any currently detected hand establishes a one-person lower
+                # bound even when a frontal face is not visible to occupancy.
+                preview_context = alert_context(
+                    people, config, signaler_people_floor=1 if hand_results else 0
+                )
                 preview = draw_preview(
                     frame, hand_results, people, preview_context, config, config["paused"], self._hand_status
                 )
                 self._publish_preview(preview, config, now)
+        except Exception as exc:
+            if self._is_uploaded_video:
+                self._offline_failure_detail = f"Offline analysis stopped unexpectedly: {exc}"
+            self.socket.send({"event": "ENGINE_STATUS", "status": "CAMERA_ERROR", "detail": str(exc)})
+            print(f"[ENGINE] Camera worker error: {exc}")
         finally:
-            self.recorder.close_all()
+            try:
+                self.recorder.close_all(
+                    "READY" if self._is_uploaded_video and self._completed_source else "PARTIAL"
+                )
+            except Exception as exc:
+                if self._is_uploaded_video:
+                    self._completed_source = False
+                    self._offline_failure_detail = f"Could not finalize uploaded evidence: {exc}"
+                print(f"[RECORDING] Could not finalize evidence: {exc}")
+            if self._is_uploaded_video:
+                status_config = last_config or {
+                    "upload_job_id": self.camera.get("upload_job_id", ""),
+                    "camera_id": self.camera.get("camera_id", ""),
+                    "source_video_path": self.camera.get("source_video_path", self.camera.get("camera_source", "")),
+                }
+                if self._completed_source:
+                    total = self._offline_total_frames
+                    detail = (
+                        f"Processed {self._frame_count} frame(s)"
+                        + (f" of {total}" if total else "")
+                        + f"; {self._offline_detection_count} qualifying incident(s) found."
+                    )
+                    self._send_uploaded_video_status("COMPLETE", status_config, detail, reliable=True)
+                elif self._offline_failure_detail:
+                    self._send_uploaded_video_status(
+                        "FAILED", status_config, self._offline_failure_detail, reliable=True)
             if self.capture is not None:
                 self.capture.release()
             if self.detector is not None:
@@ -2910,7 +4089,108 @@ class MultiCameraVisionEngine:
     def __init__(self) -> None:
         self.socket = EngineSocketClient(WS_URL, CONFIG)
         self._workers: Dict[str, CameraWorker] = {}
+        self._upload_workers: Dict[str, CameraWorker] = {}
+        self._upload_lock = threading.RLock()
         self._camera_fingerprint: Tuple[Tuple[Any, ...], ...] = ()
+        # The WebSocket thread only requests a restart.  The display/main
+        # loop owns OpenCV workers and performs the stop/reconnect safely.
+        self._restart_requested = threading.Event()
+        self.socket.set_uploaded_video_handler(self.queue_uploaded_video)
+        self.socket.set_restart_handler(self.request_live_restart)
+
+    def request_live_restart(self) -> Tuple[bool, str]:
+        """Queue a non-destructive restart of live camera workers.
+
+        Uploaded-video workers deliberately continue: a dashboard restart
+        should reconnect live capture/detectors without throwing away an
+        already-running offline evidence analysis.
+        """
+        self._restart_requested.set()
+        return True, "Restart queued. Enabled live camera workers will reconnect; settings and evidence are retained."
+
+    def queue_uploaded_video(self, command: Dict[str, Any]) -> Tuple[bool, str]:
+        """Queue one local demonstration video without changing live cameras.
+
+        Java chooses the path on the same host as this local engine.  The
+        video is read in place; no network binary upload or source overwrite
+        happens here.  A single concurrent upload prevents an offline test
+        from starving active camera ingestion.
+        """
+        raw_source = command.get("source_path")
+        if not isinstance(raw_source, str) or not raw_source.strip():
+            return False, "Choose a readable local video file before starting offline analysis."
+        try:
+            source = Path(raw_source).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            return False, f"The selected video cannot be opened on this engine: {exc}"
+        if not source.is_file():
+            return False, "The selected upload source is not a regular video file."
+        if source.suffix.casefold() not in {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}:
+            return False, "Choose a supported video file (MP4, AVI, MOV, MKV, WEBM, or M4V)."
+        with self._upload_lock:
+            busy = [worker for worker in self._upload_workers.values() if worker.is_alive()]
+            if busy:
+                return False, "Offline video analysis is already running. Wait for it to complete before queuing another video."
+            self._upload_workers = {
+                job_id: worker for job_id, worker in self._upload_workers.items() if worker.is_alive()
+            }
+            job_id = f"upload-{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}-{uuid.uuid4().hex[:6]}"
+            requested_id = command.get("camera_id")
+            if not isinstance(requested_id, str) or not requested_id.strip():
+                requested_id = "UPLOADED-VIDEO"
+            camera_id = re.sub(r"\s+", "-", requested_id.strip())[:56] or "UPLOADED-VIDEO"
+            camera_id = f"UPLOAD-{camera_id}-{job_id.rsplit('-', 1)[-1]}"
+            requested_location = command.get("location")
+            location = requested_location.strip() if isinstance(requested_location, str) and requested_location.strip() else "Uploaded video analysis"
+            global_config, _revision = CONFIG.snapshot()
+            profile = profile_for_camera_type("custom")
+            upload_camera = {
+                "camera_source": str(source),
+                "camera_id": camera_id,
+                "location": location[:120],
+                "camera_type": "custom",
+                "aspect_ratio": profile["aspect_ratio"],
+                "resolution": profile["resolution"],
+                "preview_resolution": profile["preview_resolution"],
+                "processing_scale": global_config.get("processing_scale", 1.0),
+                "uploaded_video": True,
+                "archive_source": "UPLOADED",
+                "upload_job_id": job_id,
+                "source_video_path": str(source),
+                "evidence_directory": str(UPLOADED_EVIDENCE_DIR / job_id),
+            }
+            worker = CameraWorker(upload_camera, self.socket)
+            self._upload_workers[job_id] = worker
+            self.socket.send({
+                "event": "UPLOADED_VIDEO_STATUS",
+                "archive_source": "UPLOADED",
+                "upload_job_id": job_id,
+                "cameraId": camera_id,
+                "source_name": source.name,
+                "stage": "QUEUED",
+                "detail": "Offline analysis is queued. The original video will not be changed.",
+                "processed_frames": 0,
+                "total_frames": 0,
+                "detected_incidents": 0,
+            })
+            worker.start()
+        self.socket.send({
+            "event": "ENGINE_STATUS",
+            "status": "UPLOADED_VIDEO_QUEUED",
+            "connected": True,
+            "paused": False,
+            "cameraId": camera_id,
+            "archive_source": "UPLOADED",
+            "upload_job_id": job_id,
+            "detail": f"Offline analysis queued for {source.name}. Results will be written to Uploaded Evidence.",
+        })
+        return True, f"Queued {source.name} for offline analysis. Results will appear in Uploaded Evidence."
+
+    def _reconcile_uploaded_workers(self) -> None:
+        with self._upload_lock:
+            self._upload_workers = {
+                job_id: worker for job_id, worker in self._upload_workers.items() if worker.is_alive()
+            }
 
     @staticmethod
     def _fingerprint(cameras: Sequence[Dict[str, Any]]) -> Tuple[Tuple[Any, ...], ...]:
@@ -2930,6 +4210,12 @@ class MultiCameraVisionEngine:
         desired = {str(camera["camera_id"]): camera for camera in cameras}
         current = dict(self._workers)
         for camera_id, worker in current.items():
+            # A worker released by a source failure or a restart is no longer
+            # a valid owner for this camera ID. Prune it before deciding
+            # whether a replacement can safely start.
+            if not worker.is_alive():
+                self._workers.pop(camera_id, None)
+                continue
             desired_camera = desired.get(camera_id)
             if desired_camera is None or worker.camera != desired_camera:
                 worker.stop()
@@ -2946,6 +4232,28 @@ class MultiCameraVisionEngine:
             worker = CameraWorker(camera, self.socket)
             self._workers[camera_id] = worker
             worker.start()
+
+    def _restart_live_workers(self, config: Dict[str, Any]) -> None:
+        """Release live inputs/detectors, then let reconciliation reopen them."""
+        workers = list(self._workers.items())
+        for _camera_id, worker in workers:
+            worker.stop()
+        # A bounded join releases ordinary webcam/network resources quickly
+        # without allowing a stuck source to freeze the ingestion UI.
+        for _camera_id, worker in workers:
+            worker.join(timeout=0.50)
+        self._workers = {
+            camera_id: worker
+            for camera_id, worker in self._workers.items()
+            if worker.is_alive()
+        }
+        self.socket.send({
+            "event": "ENGINE_STATUS",
+            "status": "RESTARTING",
+            "connected": True,
+            "paused": bool(config.get("paused", False)),
+            "detail": "Restarting enabled live camera workers. Uploaded-video analysis, settings, and evidence are retained.",
+        })
 
     @staticmethod
     def _placeholder(camera: Dict[str, Any], width: int, height: int) -> Any:
@@ -3052,11 +4360,15 @@ class MultiCameraVisionEngine:
                 config, _revision = CONFIG.snapshot()
                 cameras = configured_cameras(config)
                 fingerprint = self._fingerprint(cameras)
+                if self._restart_requested.is_set():
+                    self._restart_requested.clear()
+                    self._restart_live_workers(config)
                 # Reconcile every UI tick, not only when the requested
                 # fingerprint changes.  A released but stalled phone worker
                 # can terminate just after a settings update; this next pass
                 # then removes it and starts the requested replacement.
                 self._reconcile_workers(cameras)
+                self._reconcile_uploaded_workers()
                 self._camera_fingerprint = fingerprint
 
                 cv2.imshow(window_name, self._compose_preview(cameras))
@@ -3071,9 +4383,17 @@ class MultiCameraVisionEngine:
         finally:
             for worker in list(self._workers.values()):
                 worker.stop()
+            with self._upload_lock:
+                upload_workers = list(self._upload_workers.values())
+            for worker in upload_workers:
+                worker.stop()
             for worker in list(self._workers.values()):
                 worker.join()
+            for worker in upload_workers:
+                worker.join()
             self._workers.clear()
+            with self._upload_lock:
+                self._upload_workers.clear()
             self.socket.stop()
             cv2.destroyAllWindows()
 

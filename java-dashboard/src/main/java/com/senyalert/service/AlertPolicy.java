@@ -7,6 +7,14 @@ import com.senyalert.model.EngineSettings;
 /** Keeps triage policy out of the WebSocket layer and the Swing view. */
 public final class AlertPolicy {
     public AlertMode decide(DistressEvent event, EngineSettings settings) {
+        // The Python engine evaluates the same dashboard policy for each
+        // camera.  Its QUIET decision is a conservative one-way safety hint:
+        // honor it if a reconnect or a save/ack race leaves this dashboard
+        // momentarily behind, but never let an engine LOUD hint bypass the
+        // locally configured threshold or audible-alarm switch.
+        if (event.engineRequestedQuiet()) {
+            return AlertMode.QUIET;
+        }
         boolean crowdRequiresQuietWatch = settings.peopleDetectionEnabled()
                 && event.peopleCount() >= settings.quietAtOrAbovePeople();
         boolean occupancyIsStale = event.peopleCountStale()

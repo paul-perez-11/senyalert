@@ -11,6 +11,11 @@ import org.json.JSONObject;
  */
 public record EngineSettings(
         double confidenceThreshold,
+        double gestureSensitivity,
+        double thumbTuckConfidenceBonus,
+        double indexFoldConfidenceBonus,
+        double repeatedHandsignMinConfidence,
+        double repeatedHandsignConfidenceTarget,
         int preEventSeconds,
         int postEventSeconds,
         boolean requireThumb,
@@ -27,6 +32,16 @@ public record EngineSettings(
 
     public EngineSettings {
         confidenceThreshold = clamp(confidenceThreshold, 0.10, 0.99);
+        // 100% is the calibrated groupmate-compatible geometry.  Operators
+        // can make the recognition rule up to 50% more or less permissive,
+        // while confidenceThreshold remains a separate final incident gate.
+        gestureSensitivity = clamp(gestureSensitivity, 0.50, 1.50);
+        thumbTuckConfidenceBonus = clamp(thumbTuckConfidenceBonus, 0.00, 0.30);
+        indexFoldConfidenceBonus = clamp(indexFoldConfidenceBonus, 0.00, 0.30);
+        repeatedHandsignMinConfidence = clamp(repeatedHandsignMinConfidence, 0.50, 0.95);
+        repeatedHandsignConfidenceTarget = Math.max(
+                repeatedHandsignMinConfidence,
+                clamp(repeatedHandsignConfidenceTarget, 0.50, 1.00));
         preEventSeconds = clamp(preEventSeconds, 1, 60);
         postEventSeconds = clamp(postEventSeconds, 1, 60);
         cameraSource = CameraSettings.validateSource(cameraSource);
@@ -50,7 +65,7 @@ public record EngineSettings(
 
     public static EngineSettings defaults() {
         return new EngineSettings(
-                0.70, 12, 12, true, true,
+                0.70, 1.50, 0.10, 0.10, 0.50, 0.75, 12, 12, true, true,
                 "0", "CAM-01-LAPTOP", "Public Intake Counter A",
                 2, true, 8, 4, true,
                 List.of(new CameraSettings("0", "CAM-01-LAPTOP", "Public Intake Counter A")));
@@ -82,6 +97,11 @@ public record EngineSettings(
         }
         return new EngineSettings(
                 json.optDouble("confidence_threshold", fallback.confidenceThreshold()),
+                json.optDouble("gesture_sensitivity", fallback.gestureSensitivity()),
+                json.optDouble("thumb_tuck_confidence_bonus", fallback.thumbTuckConfidenceBonus()),
+                json.optDouble("index_fold_confidence_bonus", fallback.indexFoldConfidenceBonus()),
+                json.optDouble("repeated_handsign_min_confidence", fallback.repeatedHandsignMinConfidence()),
+                json.optDouble("repeated_handsign_confidence_target", fallback.repeatedHandsignConfidenceTarget()),
                 json.optInt("pre_event_sec", fallback.preEventSeconds()),
                 json.optInt("post_event_sec", fallback.postEventSeconds()),
                 fingers == null || fingers.optBoolean("thumb", fallback.requireThumb()),
@@ -112,6 +132,11 @@ public record EngineSettings(
                 .orElse(cameras.get(0));
         JSONObject payload = new JSONObject()
                 .put("confidence_threshold", confidenceThreshold)
+                .put("gesture_sensitivity", gestureSensitivity)
+                .put("thumb_tuck_confidence_bonus", thumbTuckConfidenceBonus)
+                .put("index_fold_confidence_bonus", indexFoldConfidenceBonus)
+                .put("repeated_handsign_min_confidence", repeatedHandsignMinConfidence)
+                .put("repeated_handsign_confidence_target", repeatedHandsignConfidenceTarget)
                 .put("pre_event_sec", preEventSeconds)
                 .put("post_event_sec", postEventSeconds)
                 .put("fingers", fingers)

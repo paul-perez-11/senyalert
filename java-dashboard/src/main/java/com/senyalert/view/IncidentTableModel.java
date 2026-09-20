@@ -11,7 +11,7 @@ import javax.swing.table.AbstractTableModel;
 
 final class IncidentTableModel extends AbstractTableModel {
     private static final String[] COLUMNS = {
-            "ID", "Camera", "Alert", "Confidence", "People", "Hands", "Signaler", "Status", "Time", "Evidence"
+            "ID", "Camera", "Type", "Alert", "Confidence", "People", "Hands", "Signaler", "Status", "Time", "Evidence"
     };
     private final List<Incident> incidents = new ArrayList<>();
     private final Set<Long> selectedIncidentIds = new LinkedHashSet<>();
@@ -132,14 +132,15 @@ final class IncidentTableModel extends AbstractTableModel {
         return switch (dataColumn(column)) {
             case 0 -> "#" + incident.id();
             case 1 -> incident.cameraId();
-            case 2 -> incident.alertMode().displayName();
-            case 3 -> String.format(Locale.ROOT, "%.0f%%", incident.confidence() * 100.0);
-            case 4 -> incident.peopleCount();
-            case 5 -> incident.handCount();
-            case 6 -> incident.signalerTrackId().isBlank() ? incident.signalerCount() : incident.signalerTrackId();
-            case 7 -> incident.status().name();
-            case 8 -> incident.detectionTimestamp();
-            case 9 -> incident.mediaReady() ? "Video ready" : incident.mediaStatus();
+            case 2 -> incident.incidentType().isBlank() ? "SOS handsign" : incident.incidentType();
+            case 3 -> incident.alertMode().displayName();
+            case 4 -> String.format(Locale.ROOT, "%.0f%%", incident.confidence() * 100.0);
+            case 5 -> incident.peopleCount();
+            case 6 -> incident.handCount();
+            case 7 -> incident.signalerTrackId().isBlank() ? incident.signalerCount() : incident.signalerTrackId();
+            case 8 -> incident.status().name();
+            case 9 -> incident.detectionTimestamp();
+            case 10 -> incident.mediaReady() ? "Video ready" : incident.mediaStatus();
             default -> "";
         };
     }

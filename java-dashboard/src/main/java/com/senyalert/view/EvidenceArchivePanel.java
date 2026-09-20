@@ -2,11 +2,14 @@ package com.senyalert.view;
 
 import com.senyalert.controller.DashboardActions;
 import com.senyalert.model.ArchiveExportMode;
+import com.senyalert.model.ArchiveScope;
 import com.senyalert.model.Incident;
 import com.senyalert.model.IncidentEvidence;
 import com.senyalert.model.IncidentStatus;
+import com.senyalert.model.MediaDeletionOptions;
 import com.senyalert.model.OperatorIncidentUpdate;
 import com.senyalert.view.ui.BlueTheme;
+import com.senyalert.view.ui.EmptyStateTable;
 import com.senyalert.view.ui.RoundedPanel;
 import com.senyalert.view.ui.StyledButton;
 import java.awt.BorderLayout;
@@ -36,7 +39,6 @@ import javax.swing.JTextArea;
 import javax.swing.JTextField;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
-import javax.swing.JTabbedPane;
 import org.kordamp.ikonli.fontawesome6.FontAwesomeSolid;
 
 /**
@@ -44,33 +46,25 @@ import org.kordamp.ikonli.fontawesome6.FontAwesomeSolid;
  * so operators can inspect one incident without losing a bulk selection.
  */
 final class EvidenceArchivePanel extends JPanel {
+    private final ArchiveScope scope;
     private final IncidentTableModel archiveModel = new IncidentTableModel(true);
     private DashboardActions actions;
     private IncidentViewerDialog viewer;
 
-    EvidenceArchivePanel() {
+    EvidenceArchivePanel(ArchiveScope scope) {
+        this.scope = scope == null ? ArchiveScope.RECORDED : scope;
         setLayout(new BorderLayout());
         setBackground(BlueTheme.BACKGROUND);
         setBorder(BorderFactory.createEmptyBorder(10, 12, 12, 12));
 
-        JTabbedPane archiveTabs = new JTabbedPane();
-        archiveTabs.setFont(BlueTheme.font(Font.BOLD, 13));
-        archiveTabs.addTab("Records", buildArchiveTab(
-                "Incident records",
-                "Select rows with checkboxes for safe workflow updates, export, or database-only removal.",
-                ArchiveExportMode.RECORD_BUNDLE,
-                true));
-        archiveTabs.addTab("Snapshots", buildArchiveTab(
-                "Image snapshots",
-                "Export copies of stored snapshots. Database removal never deletes the source image files.",
-                ArchiveExportMode.SNAPSHOTS,
-                false));
-        archiveTabs.addTab("Video clips", buildArchiveTab(
-                "Video evidence",
-                "Export copies of video evidence. Database removal never deletes the source video files.",
-                ArchiveExportMode.VIDEOS,
-                false));
-        add(archiveTabs, BorderLayout.CENTER);
+        String sourceText = this.scope == ArchiveScope.UPLOADED
+                ? "offline-upload results"
+                : "live recorded incidents";
+        add(buildArchiveTab(
+                this.scope.displayName(),
+                "Select rows with checkboxes for safe workflow updates, complete evidence export, or removal of "
+                        + sourceText + ".",
+                true), BorderLayout.CENTER);
     }
 
     void setActions(DashboardActions actions) {
@@ -99,22 +93,22 @@ final class EvidenceArchivePanel extends JPanel {
             viewer.setActions(
                     (incidentId, update) -> {
                         if (actions != null) {
-                            actions.updateOperatorRecord(incidentId, update);
+                            actions.updateOperatorRecord(scope, incidentId, update);
+                        }
+                    },
+                    (incidentId, options) -> {
+                        if (actions != null) {
+                            actions.deleteIncidentRecords(scope, List.of(incidentId), options);
                         }
                     },
                     incidentId -> {
                         if (actions != null) {
-                            actions.deleteIncidentRecord(incidentId);
-                        }
-                    },
-                    incidentId -> {
-                        if (actions != null) {
-                            actions.playVideoNatively(incidentId);
+                            actions.playVideoNatively(scope, incidentId);
                         }
                     },
                     (incidentId, destination, mode) -> {
                         if (actions != null) {
-                            actions.exportArchive(List.of(incidentId), destination, mode);
+                            actions.exportArchive(scope, List.of(incidentId), destination, mode);
                         }
                     });
         }
@@ -131,7 +125,6 @@ final class EvidenceArchivePanel extends JPanel {
     private JPanel buildArchiveTab(
             String title,
             String help,
-            ArchiveExportMode exportMode,
             boolean includeBulkUpdate) {
         RoundedPanel card = new RoundedPanel(18);
         card.setLayout(new BorderLayout(0, 10));
@@ -162,11 +155,11 @@ final class EvidenceArchivePanel extends JPanel {
         JScrollPane scroll = new JScrollPane(table);
         scroll.setBorder(BorderFactory.createLineBorder(BlueTheme.BORDER));
         card.add(scroll, BorderLayout.CENTER);
-        card.add(buildToolbar(table, exportMode, includeBulkUpdate), BorderLayout.SOUTH);
+        card.add(buildToolbar(table, includeBulkUpdate), BorderLayout.SOUTH);
         return card;
     }
 
-    private JPanel buildToolbar(JTable table, ArchiveExportMode exportMode, boolean includeBulkUpdate) {
+    private JPanel buildToolbar(JTable table, boolean includeBulkUpdate) {
         JPanel toolbar = transparent(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0));
         StyledButton view = new StyledButton("View / update", FontAwesomeSolid.DATABASE, BlueTheme.PRIMARY);
         view.addActionListener(event -> openForView(table));
@@ -183,9 +176,9 @@ final class EvidenceArchivePanel extends JPanel {
             bulkUpdate.addActionListener(event -> showBulkUpdateDialog());
             toolbar.add(bulkUpdate);
         }
-        StyledButton exportAll = new StyledButton("Export all…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
-        exportAll.setToolTipText("Exports checked records, or every archive record when none are checked.");
-        exportAll.addActionListener(event -> chooseArchiveExport(exportMode));
+        StyledButton exportAll = new StyledButton("Export complete bundle…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
+        exportAll.setToolTipText("Exports the record report plus every available snapshot and video for checked records, or all records when none are checked.");
+        exportAll.addActionListener(event -> chooseArchiveExport());
         StyledButton deleteAll = new StyledButton("Delete all…", FontAwesomeSolid.EXCLAMATION_TRIANGLE, BlueTheme.DANGER);
         deleteAll.setToolTipText("Deletes checked records, or requires a typed confirmation to remove all archive database records.");
         deleteAll.addActionListener(event -> confirmArchiveDelete());
@@ -195,18 +188,32 @@ final class EvidenceArchivePanel extends JPanel {
     }
 
     private JTable createArchiveTable() {
-        JTable table = new JTable(archiveModel);
+        JTable table = new EmptyStateTable(
+                archiveModel,
+                "No archived incidents",
+                "When a detection is stored, its record and evidence will be available here.");
         table.setFont(BlueTheme.font(Font.PLAIN, 12));
         table.setForeground(BlueTheme.TEXT);
         table.setBackground(Color.WHITE);
-        table.setRowHeight(26);
+        table.setRowHeight(28);
+        table.setSelectionBackground(new Color(211, 231, 249));
+        table.setSelectionForeground(BlueTheme.TEXT);
+        table.setGridColor(new Color(229, 237, 246));
+        table.setShowVerticalLines(false);
+        table.setShowHorizontalLines(true);
+        table.setIntercellSpacing(new Dimension(0, 1));
+        table.setFillsViewportHeight(true);
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         table.setAutoCreateRowSorter(true);
         table.getTableHeader().setFont(BlueTheme.font(Font.BOLD, 11));
         table.getTableHeader().setBackground(new Color(229, 239, 249));
         table.getTableHeader().setForeground(BlueTheme.TEXT);
+        table.getTableHeader().setReorderingAllowed(false);
         table.getColumnModel().getColumn(0).setMinWidth(55);
         table.getColumnModel().getColumn(0).setMaxWidth(65);
+        table.getAccessibleContext().setAccessibleName("Evidence archive");
+        table.getAccessibleContext().setAccessibleDescription(
+                "Archive records with checkboxes for safe bulk actions. Open a record to see read-only detection data and editable operator fields.");
         installPopupMenu(table);
         return table;
     }
@@ -286,14 +293,14 @@ final class EvidenceArchivePanel extends JPanel {
             return;
         }
         if (incident != null) {
-            actions.selectIncidentForArchive(incident.id());
+            actions.selectIncidentForArchive(scope, incident.id());
         }
     }
 
     private void updateFocusedStatus(JTable table, IncidentStatus status) {
         Incident incident = focusedIncident(table);
         if (incident != null && actions != null) {
-            actions.updateOperatorRecord(incident.id(), new OperatorIncidentUpdate(status, incident.operatorNotes()));
+            actions.updateOperatorRecord(scope, incident.id(), new OperatorIncidentUpdate(status, incident.operatorNotes()));
         }
     }
 
@@ -310,16 +317,7 @@ final class EvidenceArchivePanel extends JPanel {
         if (incident == null || actions == null) {
             return;
         }
-        int choice = JOptionPane.showConfirmDialog(
-                this,
-                "Delete incident #" + incident.id() + " from SQLite?\n\n"
-                        + "Its original snapshot and video files are not deleted.",
-                "Delete database record",
-                JOptionPane.YES_NO_OPTION,
-                JOptionPane.WARNING_MESSAGE);
-        if (choice == JOptionPane.YES_OPTION) {
-            actions.deleteIncidentRecords(List.of(incident.id()));
-        }
+        confirmDeleteRecords(List.of(incident.id()), false);
     }
 
     private void showBulkUpdateDialog() {
@@ -365,16 +363,16 @@ final class EvidenceArchivePanel extends JPanel {
             JOptionPane.showMessageDialog(this, invalid.getMessage(), "Check operator update", JOptionPane.WARNING_MESSAGE);
             return;
         }
-        actions.updateOperatorRecords(updates);
+        actions.updateOperatorRecords(scope, updates);
     }
 
-    private void chooseArchiveExport(ArchiveExportMode mode) {
+    private void chooseArchiveExport() {
         List<Long> ids = archiveModel.hasSelectedIncidents() ? archiveModel.selectedIds() : archiveModel.allIds();
         if (ids.isEmpty()) {
             JOptionPane.showMessageDialog(this, "There are no archive records to export.", "Export archive", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        chooseExportDirectory(ids, mode);
+        chooseExportDirectory(ids, ArchiveExportMode.RECORD_BUNDLE);
     }
 
     private void chooseExportDirectory(List<Long> ids, ArchiveExportMode mode) {
@@ -386,7 +384,7 @@ final class EvidenceArchivePanel extends JPanel {
         chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
         chooser.setAcceptAllFileFilterUsed(false);
         if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
-            actions.exportArchive(ids, chooser.getSelectedFile().toPath(), mode);
+            actions.exportArchive(scope, ids, chooser.getSelectedFile().toPath(), mode);
         }
     }
 
@@ -396,16 +394,7 @@ final class EvidenceArchivePanel extends JPanel {
         }
         List<Long> selected = archiveModel.selectedIds();
         if (!selected.isEmpty()) {
-            int choice = JOptionPane.showConfirmDialog(
-                    this,
-                    "Delete " + selected.size() + " selected database record(s)?\n\n"
-                            + "This does not delete original snapshot or video files.",
-                    "Delete selected records",
-                    JOptionPane.YES_NO_OPTION,
-                    JOptionPane.WARNING_MESSAGE);
-            if (choice == JOptionPane.YES_OPTION) {
-                actions.deleteIncidentRecords(selected);
-            }
+            confirmDeleteRecords(selected, false);
             return;
         }
         List<Long> allIds = archiveModel.allIds();
@@ -413,19 +402,46 @@ final class EvidenceArchivePanel extends JPanel {
             JOptionPane.showMessageDialog(this, "There are no archive records to delete.", "Delete all", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        JTextField phrase = new JTextField(16);
-        JPanel confirmation = transparent(new BorderLayout(0, 8));
-        confirmation.add(new JLabel("Type DELETE ALL to remove all " + allIds.size() + " database records."), BorderLayout.NORTH);
-        confirmation.add(phrase, BorderLayout.CENTER);
-        confirmation.add(new JLabel("Original image and video files will remain untouched."), BorderLayout.SOUTH);
-        int choice = JOptionPane.showConfirmDialog(this, confirmation, "Delete entire evidence archive",
+        confirmDeleteRecords(allIds, true);
+    }
+
+    private void confirmDeleteRecords(List<Long> ids, boolean requireAllPhrase) {
+        if (actions == null || ids == null || ids.isEmpty()) {
+            return;
+        }
+        JCheckBox deleteSnapshot = new JCheckBox("Delete associated image snapshots");
+        JCheckBox deleteVideo = new JCheckBox("Delete associated video clips");
+        deleteSnapshot.setOpaque(false);
+        deleteVideo.setOpaque(false);
+        JPanel choices = transparent(new BorderLayout(0, 7));
+        String count = ids.size() == 1 ? "this database record" : ids.size() + " database records";
+        choices.add(new JLabel("Delete " + count + " from " + scope.displayName().toLowerCase() + "?"), BorderLayout.NORTH);
+        JPanel mediaChoices = transparent(new java.awt.GridLayout(0, 1, 0, 3));
+        mediaChoices.add(new JLabel("Optional source-media cleanup (only checked exact file paths are removed):"));
+        mediaChoices.add(deleteSnapshot);
+        mediaChoices.add(deleteVideo);
+        choices.add(mediaChoices, BorderLayout.CENTER);
+        JTextField phrase = null;
+        if (requireAllPhrase) {
+            phrase = new JTextField(16);
+            JPanel allConfirmation = transparent(new BorderLayout(0, 3));
+            allConfirmation.add(new JLabel("Type DELETE ALL to confirm every record in this archive."), BorderLayout.NORTH);
+            allConfirmation.add(phrase, BorderLayout.SOUTH);
+            choices.add(allConfirmation, BorderLayout.SOUTH);
+        }
+        int choice = JOptionPane.showConfirmDialog(this, choices,
+                requireAllPhrase ? "Delete entire " + scope.displayName() : "Delete evidence record",
                 JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
-        if (choice == JOptionPane.OK_OPTION && "DELETE ALL".equals(phrase.getText().strip())) {
-            actions.deleteIncidentRecords(allIds);
-        } else if (choice == JOptionPane.OK_OPTION) {
+        if (choice != JOptionPane.OK_OPTION) {
+            return;
+        }
+        if (requireAllPhrase && (phrase == null || !"DELETE ALL".equals(phrase.getText().strip()))) {
             JOptionPane.showMessageDialog(this, "Nothing was deleted. The confirmation phrase did not match.",
                     "Delete all cancelled", JOptionPane.INFORMATION_MESSAGE);
+            return;
         }
+        actions.deleteIncidentRecords(scope, ids,
+                new MediaDeletionOptions(deleteSnapshot.isSelected(), deleteVideo.isSelected()));
     }
 
     private Incident focusedIncident(JTable table) {

@@ -1,12 +1,15 @@
 package com.senyalert.view;
 
 import com.senyalert.controller.DashboardActions;
+import com.senyalert.model.ArchiveScope;
 import com.senyalert.model.CameraPreviewFrame;
 import com.senyalert.model.EngineSettings;
 import com.senyalert.model.EngineStatus;
 import com.senyalert.model.Incident;
 import com.senyalert.model.IncidentEvidence;
+import com.senyalert.model.UploadedVideoStatus;
 import com.senyalert.view.ui.BlueTheme;
+import com.senyalert.view.ui.EmptyStateTable;
 import com.senyalert.view.ui.RoundedPanel;
 import com.senyalert.view.ui.StyledButton;
 import java.awt.BorderLayout;
@@ -30,6 +33,7 @@ import javax.swing.JOptionPane;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import javax.swing.event.ListSelectionEvent;
+import org.kordamp.ikonli.Ikon;
 import org.kordamp.ikonli.fontawesome6.FontAwesomeSolid;
 import org.kordamp.ikonli.swing.FontIcon;
 
@@ -37,17 +41,24 @@ import org.kordamp.ikonli.swing.FontIcon;
 public class DashboardFrame extends JFrame implements DashboardView {
     private final IncidentTableModel incidentModel = new IncidentTableModel();
     private final PagedIncidentTableModel dispatchIncidentModel = new PagedIncidentTableModel(incidentModel);
+    private final EmptyStateTable dispatchTable = new EmptyStateTable(
+            dispatchIncidentModel,
+            "Loading the incident queue",
+            "Checking recent events in the local incident store.");
     private final AlertBanner alertBanner = new AlertBanner();
     private final EvidencePanel evidencePanel = new EvidencePanel();
-    private final EvidenceArchivePanel evidenceArchivePanel = new EvidenceArchivePanel();
+    private final EvidenceArchivePanel evidenceArchivePanel = new EvidenceArchivePanel(ArchiveScope.RECORDED);
+    private final EvidenceArchivePanel uploadedEvidenceArchivePanel = new EvidenceArchivePanel(ArchiveScope.UPLOADED);
     private final CameraPreviewGrid previewGrid = new CameraPreviewGrid();
     private final SettingsPanel settingsPanel = new SettingsPanel();
     private final CameraManagementPanel cameraManagementPanel = new CameraManagementPanel();
+    private final VideoUploadPanel videoUploadPanel = new VideoUploadPanel();
     private final JTabbedPane tabs = new JTabbedPane();
     private final JLabel engineStatus = new JLabel("Starting dashboard…");
     private final JLabel cameraStatus = new JLabel("Camera: awaiting engine");
     private final JLabel activeMetric = new JLabel("0");
     private final JLabel infoStrip = new JLabel("Ready");
+    private final JPanel infoStripContainer = new JPanel(new BorderLayout(6, 0));
     private final JComboBox<Integer> dispatchPageSize = new JComboBox<>(new Integer[]{5, 10, 20, 50});
     private final JButton dispatchPreviousPage = paginationButton("‹ Previous");
     private final JButton dispatchNextPage = paginationButton("Next ›");
@@ -60,6 +71,7 @@ public class DashboardFrame extends JFrame implements DashboardView {
         setMinimumSize(new Dimension(1024, 640));
         setSize(1220, 720);
         setLocationByPlatform(true);
+        configureIncidentTable(dispatchTable, false);
 
         JPanel root = new JPanel(new BorderLayout());
         root.setBackground(BlueTheme.BACKGROUND);
@@ -75,14 +87,20 @@ public class DashboardFrame extends JFrame implements DashboardView {
     @Override
     public void setActions(DashboardActions actions) {
         this.actions = actions;
-        settingsPanel.setActions(actions::saveSettings, actions::toggleEnginePause);
+        settingsPanel.setActions(actions::saveSettings, actions::toggleEnginePause, actions::restartEngine);
         cameraManagementPanel.setSaveAction(actions::saveSettings);
+        cameraManagementPanel.setPhoneCameraActions(
+                actions::connectAndroidIpCamera,
+                actions::applyIpCameraZoom);
         evidencePanel.setActions(
                 actions::updateOperatorRecord,
-                actions::deleteIncidentRecord,
+                (incidentId, options) -> actions.deleteIncidentRecords(
+                        ArchiveScope.RECORDED, List.of(incidentId), options),
                 actions::playVideoNatively,
                 actions::exportVideo);
         evidenceArchivePanel.setActions(actions);
+        uploadedEvidenceArchivePanel.setActions(actions);
+        videoUploadPanel.setSubmitAction(actions::submitUploadedVideo);
     }
 
     @Override
@@ -95,6 +113,9 @@ public class DashboardFrame extends JFrame implements DashboardView {
     @Override
     public void showIncidents(List<Incident> incidents) {
         incidentModel.replaceAll(incidents);
+        dispatchTable.setEmptyState(
+                "No incidents waiting",
+                "New SOS detections will appear here automatically.");
         evidenceArchivePanel.showIncidents(incidents);
         dispatchIncidentModel.goToFirstPage();
         updateActiveMetric();
@@ -103,9 +124,22 @@ public class DashboardFrame extends JFrame implements DashboardView {
     @Override
     public void upsertIncident(Incident incident) {
         incidentModel.upsert(incident);
+        dispatchTable.setEmptyState(
+                "No incidents waiting",
+                "New SOS detections will appear here automatically.");
         evidenceArchivePanel.upsertIncident(incident);
         dispatchIncidentModel.goToFirstPage();
         updateActiveMetric();
+    }
+
+    @Override
+    public void showUploadedIncidents(List<Incident> incidents) {
+        uploadedEvidenceArchivePanel.showIncidents(incidents);
+    }
+
+    @Override
+    public void upsertUploadedIncident(Incident incident) {
+        uploadedEvidenceArchivePanel.upsertIncident(incident);
     }
 
     @Override
@@ -117,9 +151,19 @@ public class DashboardFrame extends JFrame implements DashboardView {
     }
 
     @Override
+    public void removeUploadedIncident(long incidentId) {
+        uploadedEvidenceArchivePanel.removeIncident(incidentId);
+    }
+
+    @Override
     public void showOperatorRecordUpdated(Incident incident) {
         evidencePanel.showOperatorRecordUpdated(incident);
         evidenceArchivePanel.showOperatorRecordUpdated(incident);
+    }
+
+    @Override
+    public void showUploadedOperatorRecordUpdated(Incident incident) {
+        uploadedEvidenceArchivePanel.showOperatorRecordUpdated(incident);
     }
 
     @Override
@@ -129,7 +173,16 @@ public class DashboardFrame extends JFrame implements DashboardView {
 
     @Override
     public void showArchiveIncidentEvidence(IncidentEvidence evidence) {
-        evidenceArchivePanel.showEvidence(evidence);
+        showArchiveIncidentEvidence(ArchiveScope.RECORDED, evidence);
+    }
+
+    @Override
+    public void showArchiveIncidentEvidence(ArchiveScope scope, IncidentEvidence evidence) {
+        if (scope == ArchiveScope.UPLOADED) {
+            uploadedEvidenceArchivePanel.showEvidence(evidence);
+        } else {
+            evidenceArchivePanel.showEvidence(evidence);
+        }
     }
 
     @Override
@@ -144,11 +197,22 @@ public class DashboardFrame extends JFrame implements DashboardView {
 
     @Override
     public void showEngineStatus(EngineStatus status) {
-        engineStatus.setText(status.connected()
+        boolean connected = status.connected();
+        Color statusColor = connected ? (status.paused() ? BlueTheme.QUIET : BlueTheme.SUCCESS) : BlueTheme.DANGER;
+        engineStatus.setText(connected
                 ? (status.paused() ? "Engine paused" : "Engine connected")
                 : "Engine offline");
-        engineStatus.setForeground(status.connected() ? (status.paused() ? BlueTheme.QUIET : BlueTheme.SUCCESS) : BlueTheme.DANGER);
-        cameraStatus.setText(status.cameraId().isBlank() ? status.message() : "Camera " + status.cameraId() + " · " + status.message());
+        engineStatus.setForeground(statusColor);
+        engineStatus.setIcon(FontIcon.of(connected && !status.paused()
+                ? FontAwesomeSolid.CHECK : connected ? FontAwesomeSolid.PAUSE : FontAwesomeSolid.EXCLAMATION_TRIANGLE,
+                11, statusColor));
+        engineStatus.setIconTextGap(6);
+        engineStatus.getAccessibleContext().setAccessibleDescription(
+                status.connected() ? "Vision engine status: " + engineStatus.getText() : "Vision engine is offline");
+        String detail = status.cameraId().isBlank() ? status.message() : "Camera " + status.cameraId() + " · " + status.message();
+        cameraStatus.setText(detail == null || detail.isBlank()
+                ? (connected ? "Waiting for the first camera update" : "Start the vision engine or check the Cameras tab")
+                : detail);
         settingsPanel.setPaused(status.paused());
     }
 
@@ -158,16 +222,26 @@ public class DashboardFrame extends JFrame implements DashboardView {
     }
 
     @Override
+    public void showUploadedVideoStatus(UploadedVideoStatus status) {
+        videoUploadPanel.showAnalysisStatus(status);
+    }
+
+    @Override
     public void showInfo(String message) {
-        infoStrip.setForeground(BlueTheme.PRIMARY.darker());
-        infoStrip.setText(message);
+        showStatusMessage(BlueTheme.INFO, BlueTheme.INFO_TINT, FontAwesomeSolid.CHECK, message);
     }
 
     @Override
     public void showError(String title, String message) {
-        infoStrip.setForeground(BlueTheme.DANGER);
-        infoStrip.setText(title + ": " + message);
-        JOptionPane.showMessageDialog(this, message, title, JOptionPane.ERROR_MESSAGE);
+        String safeTitle = title == null || title.isBlank() ? "Dashboard action" : title;
+        String safeMessage = message == null || message.isBlank() ? "An unexpected problem occurred." : message;
+        showStatusMessage(BlueTheme.DANGER, BlueTheme.DANGER_TINT, FontAwesomeSolid.EXCLAMATION_TRIANGLE,
+                safeTitle + " failed: " + safeMessage);
+        JOptionPane.showMessageDialog(
+                this,
+                safeMessage + "\n\nThe dashboard remains open. Check the engine or storage connection and try again.",
+                safeTitle + " failed",
+                JOptionPane.ERROR_MESSAGE);
     }
 
     private JPanel buildHeader() {
@@ -212,10 +286,17 @@ public class DashboardFrame extends JFrame implements DashboardView {
     private JTabbedPane buildTabs() {
         tabs.setFont(BlueTheme.font(Font.BOLD, 13));
         tabs.setBackground(BlueTheme.BACKGROUND);
+        tabs.setForeground(BlueTheme.TEXT);
         tabs.addTab(" Live dispatch", FontIcon.of(FontAwesomeSolid.BELL, 16, BlueTheme.PRIMARY), buildDispatchTab());
         tabs.addTab(" Cameras", FontIcon.of(FontAwesomeSolid.CAMERA, 16, BlueTheme.PRIMARY), cameraManagementPanel);
+        tabs.addTab(" Video analysis", FontIcon.of(FontAwesomeSolid.FILE_VIDEO, 16, BlueTheme.PRIMARY), videoUploadPanel);
         tabs.addTab(" Evidence archive", FontIcon.of(FontAwesomeSolid.DATABASE, 16, BlueTheme.PRIMARY), buildArchiveTab());
         tabs.addTab(" Engine settings", FontIcon.of(FontAwesomeSolid.COG, 16, BlueTheme.PRIMARY), settingsPanel);
+        tabs.setToolTipTextAt(0, "Triage the latest SOS detections and inspect current camera snapshots.");
+        tabs.setToolTipTextAt(1, "Add, disable, and tune each camera source independently.");
+        tabs.setToolTipTextAt(2, "Run the same vision pipeline against a selected local demonstration video.");
+        tabs.setToolTipTextAt(3, "Review recorded and uploaded evidence separately.");
+        tabs.setToolTipTextAt(4, "Configure detection, triage, and engine behaviour.");
         return tabs;
     }
 
@@ -244,8 +325,14 @@ public class DashboardFrame extends JFrame implements DashboardView {
         return panel;
     }
 
-    private JPanel buildArchiveTab() {
-        return evidenceArchivePanel;
+    private javax.swing.JComponent buildArchiveTab() {
+        JTabbedPane archiveSources = new JTabbedPane();
+        archiveSources.setFont(BlueTheme.font(Font.BOLD, 12));
+        archiveSources.addTab("Recorded", FontIcon.of(FontAwesomeSolid.CAMERA, 14, BlueTheme.PRIMARY), evidenceArchivePanel);
+        archiveSources.addTab("Uploaded", FontIcon.of(FontAwesomeSolid.FILE_VIDEO, 14, BlueTheme.PRIMARY), uploadedEvidenceArchivePanel);
+        archiveSources.setToolTipTextAt(0, "Incidents captured from active camera streams and stored in incidents.db.");
+        archiveSources.setToolTipTextAt(1, "Offline video-analysis results stored separately in uploaded-incidents.db.");
+        return archiveSources;
     }
 
     private RoundedPanel incidentTableCard(String headingText) {
@@ -257,19 +344,26 @@ public class DashboardFrame extends JFrame implements DashboardView {
         heading.setFont(BlueTheme.font(Font.BOLD, 16));
         heading.setForeground(BlueTheme.TEXT);
         card.add(heading, BorderLayout.NORTH);
-        JScrollPane scroll = new JScrollPane(createIncidentTable(false));
+        JScrollPane scroll = new JScrollPane(dispatchTable);
         scroll.setBorder(BorderFactory.createLineBorder(BlueTheme.BORDER));
+        scroll.getViewport().setBackground(Color.WHITE);
         card.add(scroll, BorderLayout.CENTER);
         card.add(buildDispatchPagination(), BorderLayout.SOUTH);
         return card;
     }
 
-    private JTable createIncidentTable(boolean openDispatchForEvidence) {
-        JTable table = new JTable(openDispatchForEvidence ? incidentModel : dispatchIncidentModel);
+    private void configureIncidentTable(JTable table, boolean openDispatchForEvidence) {
         table.setFont(BlueTheme.font(Font.PLAIN, 11));
         table.setForeground(BlueTheme.TEXT);
         table.setBackground(Color.WHITE);
         table.setRowHeight(22);
+        table.setSelectionBackground(new Color(211, 231, 249));
+        table.setSelectionForeground(BlueTheme.TEXT);
+        table.setGridColor(new Color(229, 237, 246));
+        table.setShowVerticalLines(false);
+        table.setShowHorizontalLines(true);
+        table.setIntercellSpacing(new Dimension(0, 1));
+        table.setFillsViewportHeight(true);
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         // The source model is already newest-first. Sorting a page independently
         // would make its navigation misleading, so retain sorting in Archive only.
@@ -277,8 +371,11 @@ public class DashboardFrame extends JFrame implements DashboardView {
         table.getTableHeader().setFont(BlueTheme.font(Font.BOLD, 10));
         table.getTableHeader().setBackground(new Color(229, 239, 249));
         table.getTableHeader().setForeground(BlueTheme.TEXT);
+        table.getTableHeader().setReorderingAllowed(false);
+        table.getAccessibleContext().setAccessibleName("Live incident queue");
+        table.getAccessibleContext().setAccessibleDescription(
+                "The newest SOS incidents, with alert, confidence, occupancy, and evidence state.");
         table.getSelectionModel().addListSelectionListener(event -> selectIncident(event, table, openDispatchForEvidence));
-        return table;
     }
 
     private void selectIncident(ListSelectionEvent event, JTable table, boolean openDispatchForEvidence) {
@@ -374,11 +471,19 @@ public class DashboardFrame extends JFrame implements DashboardView {
 
     private JPanel buildFooter() {
         JPanel footer = new JPanel(new BorderLayout());
-        footer.setBackground(new Color(228, 238, 248));
-        footer.setBorder(BorderFactory.createEmptyBorder(5, 14, 5, 14));
+        footer.setBackground(BlueTheme.BACKGROUND);
+        footer.setBorder(BorderFactory.createEmptyBorder(5, 12, 7, 12));
         infoStrip.setFont(BlueTheme.font(Font.PLAIN, 11));
-        infoStrip.setForeground(BlueTheme.MUTED);
-        footer.add(infoStrip, BorderLayout.WEST);
+        infoStrip.setForeground(BlueTheme.INFO);
+        infoStrip.setIcon(FontIcon.of(FontAwesomeSolid.CHECK, 11, BlueTheme.INFO));
+        infoStrip.setIconTextGap(6);
+        infoStrip.getAccessibleContext().setAccessibleName("Dashboard status");
+        infoStripContainer.setBackground(BlueTheme.INFO_TINT);
+        infoStripContainer.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(184, 215, 244)),
+                BorderFactory.createEmptyBorder(4, 8, 4, 8)));
+        infoStripContainer.add(infoStrip, BorderLayout.CENTER);
+        footer.add(infoStripContainer, BorderLayout.WEST);
         JLabel instruction = new JLabel("Select an incident to review its evidence.");
         instruction.setFont(BlueTheme.font(Font.PLAIN, 11));
         instruction.setForeground(BlueTheme.MUTED);
@@ -427,5 +532,20 @@ public class DashboardFrame extends JFrame implements DashboardView {
         button.setBorder(BorderFactory.createEmptyBorder(5, 8, 5, 8));
         button.setMargin(new java.awt.Insets(0, 0, 0, 0));
         return button;
+    }
+
+    private void showStatusMessage(Color foreground, Color background, Ikon icon, String message) {
+        String safeMessage = message == null || message.isBlank() ? "Ready" : message;
+        infoStrip.setForeground(foreground);
+        infoStrip.setIcon(FontIcon.of(icon, 11, foreground));
+        infoStrip.setText(safeMessage);
+        infoStrip.setToolTipText(safeMessage);
+        infoStrip.getAccessibleContext().setAccessibleDescription(safeMessage);
+        infoStripContainer.setBackground(background);
+        infoStripContainer.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(foreground, 1),
+                BorderFactory.createEmptyBorder(4, 8, 4, 8)));
+        infoStripContainer.revalidate();
+        infoStripContainer.repaint();
     }
 }

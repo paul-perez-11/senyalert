@@ -1,4 +1,5 @@
 {
+  "repeated_handsign_min_confidence": 0.8,
   "aspect_ratio": [
     16,
     9
@@ -6,26 +7,27 @@
   "people_detection_enabled": true,
   "post_event_sec": 8,
   "preview_resolution": [
-    854,
-    480
+    1280,
+    720
   ],
-  "quiet_at_or_above_people": 2,
+  "quiet_at_or_above_people": 1,
   "camera_id": "CAM-01-LAPTOP",
   "camera_type": "laptop_webcam",
-  "people_detection_interval_frames": 6,
+  "repeated_handsign_confidence_target": 1,
+  "people_detection_interval_frames": 3,
   "fingers": {
     "middle": true,
-    "thumb": false,
+    "thumb": true,
     "ring": true,
     "pinky": true,
-    "index": false
+    "index": true
   },
-  "confidence_threshold": 0.5,
+  "confidence_threshold": 0.99,
   "resolution": [
-    960,
-    540
+    1920,
+    1080
   ],
-  "max_hands": 2,
+  "max_hands": 4,
   "cameras": [
     {
       "aspect_ratio": [
@@ -34,15 +36,15 @@
       ],
       "camera_source": "0",
       "preview_resolution": [
-        854,
-        480
+        1280,
+        720
       ],
       "camera_id": "CAM-01-LAPTOP",
       "camera_type": "laptop_webcam",
       "location": "Public Intake Counter A",
       "resolution": [
-        960,
-        540
+        1920,
+        1080
       ],
       "enabled": true,
       "processing_scale": 1
@@ -52,7 +54,7 @@
         9,
         16
       ],
-      "camera_source": "http://127.0.0.1:17170/video/mjpeg",
+      "camera_source": "http://127.0.0.1:17171/video/mjpeg",
       "preview_resolution": [
         540,
         960
@@ -65,11 +67,14 @@
         1920
       ],
       "enabled": false,
-      "processing_scale": 1
+      "processing_scale": 0.5
     }
   ],
   "camera_source": "0",
+  "gesture_sensitivity": 0.5,
+  "index_fold_confidence_bonus": 0.05,
   "location": "Public Intake Counter A",
-  "audible_alerts_enabled": false,
+  "thumb_tuck_confidence_bonus": 0.1,
+  "audible_alerts_enabled": true,
   "pre_event_sec": 8
 }

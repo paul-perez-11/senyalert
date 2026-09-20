@@ -4,6 +4,7 @@ import com.senyalert.model.ArchiveExportMode;
 import com.senyalert.model.ArchiveExportSummary;
 import com.senyalert.model.Incident;
 import com.senyalert.model.IncidentEvidence;
+import com.senyalert.model.MediaDeletionOptions;
 import com.senyalert.repository.IncidentRepository;
 import java.awt.Desktop;
 import java.io.IOException;
@@ -67,6 +68,27 @@ public final class MediaService {
                         throw new IllegalStateException("Could not export the incident video", exportFailure);
                     }
                 }, executors.media()));
+    }
+
+    /**
+     * Removes only the explicitly selected, exact source files referenced by
+     * an already-loaded incident. SQLite deletion is deliberately owned by
+     * the controller and happens first, so a database failure never removes
+     * source evidence. This method never traverses a directory.
+     */
+    public CompletableFuture<Void> deleteAssociatedMedia(
+            IncidentEvidence evidence, MediaDeletionOptions options) {
+        if (evidence == null || options == null || !options.deletesAnyMedia()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        return CompletableFuture.runAsync(() -> {
+            if (options.deleteSnapshot()) {
+                deleteExactRecordedFile(evidence.incident().snapshotPath(), "snapshot");
+            }
+            if (options.deleteVideo()) {
+                deleteExactRecordedFile(evidence.incident().videoPath(), "video");
+            }
+        }, executors.media());
     }
 
     /**
@@ -219,6 +241,7 @@ public final class MediaService {
                 + "Camera: " + incident.cameraId() + "\n"
                 + "Location: " + incident.location() + "\n"
                 + "Detected: " + incident.detectionTimestamp() + "\n"
+                + "Incident type: " + emptyDisplay(incident.incidentType()) + "\n"
                 + "Confidence: " + String.format(java.util.Locale.ROOT, "%.1f%%", incident.confidence() * 100.0) + "\n"
                 + "Alert policy: " + incident.alertMode().displayName() + "\n"
                 + "Status: " + incident.status() + "\n"
@@ -281,5 +304,28 @@ public final class MediaService {
             throw new IllegalStateException("The video file is unavailable at its recorded path.");
         }
         return source;
+    }
+
+    private static void deleteExactRecordedFile(String sourceValue, String mediaLabel) {
+        if (sourceValue == null || sourceValue.isBlank()) {
+            return;
+        }
+        final Path target;
+        try {
+            target = Path.of(sourceValue).toAbsolutePath().normalize();
+        } catch (RuntimeException invalidPath) {
+            throw new IllegalStateException("The recorded " + mediaLabel + " path is invalid.", invalidPath);
+        }
+        try {
+            // Resolve and inspect the exact target before deletion. There is
+            // no wildcard, parent directory, or recursive operation here.
+            if (!Files.isRegularFile(target)) {
+                return;
+            }
+            Files.delete(target);
+        } catch (IOException failure) {
+            throw new IllegalStateException("Could not delete the selected " + mediaLabel
+                    + " file at " + target.getFileName() + ".", failure);
+        }
     }
 }
