@@ -28,6 +28,12 @@ public interface IncidentRepository extends AutoCloseable {
     /** Deletes only the SQLite incident row and its stored BLOBs; never touches source media files. */
     CompletableFuture<Boolean> deleteRecord(long incidentId);
 
+    /**
+     * Resets the next SQLite AUTOINCREMENT incident ID only when this archive
+     * has no rows. This never changes incident records, BLOBs, or media files.
+     */
+    CompletableFuture<Boolean> resetNextIncidentIdIfEmpty();
+
     @Override
     void close();
 }

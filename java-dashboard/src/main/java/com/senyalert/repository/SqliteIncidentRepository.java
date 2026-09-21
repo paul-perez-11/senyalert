@@ -230,12 +230,72 @@ public final class SqliteIncidentRepository implements IncidentRepository {
     }
 
     @Override
+    public CompletableFuture<Boolean> resetNextIncidentIdIfEmpty() {
+        return CompletableFuture.supplyAsync(() -> {
+            try (Connection connection = openConnection()) {
+                boolean restoreAutoCommit = connection.getAutoCommit();
+                connection.setAutoCommit(false);
+                try {
+                    // Do not infer emptiness from a paged/stale Swing table. The
+                    // database is authoritative, and this transaction protects
+                    // the count and sequence update as one operation.
+                    try (PreparedStatement records = connection.prepareStatement(
+                            "SELECT 1 FROM incident_logs LIMIT 1");
+                         ResultSet result = records.executeQuery()) {
+                        if (result.next()) {
+                            connection.rollback();
+                            return false;
+                        }
+                    }
+
+                    // sqlite_sequence exists for AUTOINCREMENT tables. If a
+                    // legacy empty database does not have it yet, its next ID is
+                    // already 1 and there is nothing to reset.
+                    if (sqliteSequenceExists(connection)) {
+                        try (PreparedStatement sequence = connection.prepareStatement(
+                                "DELETE FROM sqlite_sequence WHERE name = ?")) {
+                            sequence.setString(1, "incident_logs");
+                            sequence.executeUpdate();
+                        }
+                    }
+                    connection.commit();
+                    return true;
+                } catch (SQLException failure) {
+                    try {
+                        connection.rollback();
+                    } catch (SQLException rollbackFailure) {
+                        failure.addSuppressed(rollbackFailure);
+                    }
+                    throw new IllegalStateException("Could not reset the next incident ID", failure);
+                } finally {
+                    try {
+                        connection.setAutoCommit(restoreAutoCommit);
+                    } catch (SQLException ignored) {
+                        // The operation result is already known and the scoped
+                        // connection will close immediately.
+                    }
+                }
+            } catch (SQLException failure) {
+                throw new IllegalStateException("Could not reset the next incident ID", failure);
+            }
+        }, executors.database());
+    }
+
+    @Override
     public void close() {
         // Connections are operation-scoped; AppExecutors owns the worker lifecycle.
     }
 
     private Connection openConnection() throws SQLException {
         return DriverManager.getConnection(databaseUrl);
+    }
+
+    private static boolean sqliteSequenceExists(Connection connection) throws SQLException {
+        String query = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence' LIMIT 1";
+        try (PreparedStatement statement = connection.prepareStatement(query);
+             ResultSet result = statement.executeQuery()) {
+            return result.next();
+        }
     }
 
     private Optional<Incident> findIncident(Connection connection, long incidentId) throws SQLException {

@@ -54,6 +54,15 @@ public interface DashboardActions {
         deleteIncidentRecords(incidentIds);
     }
 
+    /**
+     * Resets the next incident ID for an empty archive only. No records or
+     * source-media files are deleted as part of this action.
+     */
+    default CompletableFuture<Boolean> resetNextIncidentId(ArchiveScope scope) {
+        return CompletableFuture.failedFuture(new UnsupportedOperationException(
+                "Archive ID reset is not available in this dashboard session."));
+    }
+
     void saveSettings(EngineSettings settings);
 
     void toggleEnginePause();

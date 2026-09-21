@@ -1,5 +1,5 @@
 {
-  "repeated_handsign_min_confidence": 0.8,
+  "repeated_handsign_min_confidence": 0.5,
   "aspect_ratio": [
     16,
     9
@@ -13,11 +13,11 @@
   "quiet_at_or_above_people": 1,
   "camera_id": "CAM-01-LAPTOP",
   "camera_type": "laptop_webcam",
-  "repeated_handsign_confidence_target": 1,
+  "repeated_handsign_confidence_target": 0.75,
   "people_detection_interval_frames": 3,
   "fingers": {
     "middle": true,
-    "thumb": true,
+    "thumb": false,
     "ring": true,
     "pinky": true,
     "index": true
@@ -71,7 +71,7 @@
     }
   ],
   "camera_source": "0",
-  "gesture_sensitivity": 0.5,
+  "gesture_sensitivity": 1,
   "index_fold_confidence_bonus": 0.05,
   "location": "Public Intake Counter A",
   "thumb_tuck_confidence_bonus": 0.1,

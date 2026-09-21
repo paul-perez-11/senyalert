@@ -182,8 +182,12 @@ final class EvidenceArchivePanel extends JPanel {
         StyledButton deleteAll = new StyledButton("Delete all…", FontAwesomeSolid.EXCLAMATION_TRIANGLE, BlueTheme.DANGER);
         deleteAll.setToolTipText("Deletes checked records, or requires a typed confirmation to remove all archive database records.");
         deleteAll.addActionListener(event -> confirmArchiveDelete());
+        StyledButton resetNextId = new StyledButton("Reset next ID…", FontAwesomeSolid.SYNC, BlueTheme.DEEP_BLUE);
+        resetNextId.setToolTipText("Does not delete records or media. Available only when this archive is empty.");
+        resetNextId.addActionListener(event -> confirmResetNextId(resetNextId));
         toolbar.add(exportAll);
         toolbar.add(deleteAll);
+        toolbar.add(resetNextId);
         return toolbar;
     }
 
@@ -442,6 +446,35 @@ final class EvidenceArchivePanel extends JPanel {
         }
         actions.deleteIncidentRecords(scope, ids,
                 new MediaDeletionOptions(deleteSnapshot.isSelected(), deleteVideo.isSelected()));
+    }
+
+    private void confirmResetNextId(StyledButton trigger) {
+        if (actions == null) {
+            return;
+        }
+        JTextField phrase = new JTextField(16);
+        JPanel confirmation = transparent(new BorderLayout(0, 7));
+        confirmation.add(new JLabel("This only resets the next " + scope.displayName().toLowerCase()
+                + " incident ID to 1. It never deletes records, snapshots, or video clips."), BorderLayout.NORTH);
+        JPanel phrasePanel = transparent(new BorderLayout(0, 3));
+        phrasePanel.add(new JLabel("This is allowed only when the archive is empty. Type RESET ID to continue."),
+                BorderLayout.NORTH);
+        phrasePanel.add(phrase, BorderLayout.SOUTH);
+        confirmation.add(phrasePanel, BorderLayout.CENTER);
+        int choice = JOptionPane.showConfirmDialog(this, confirmation,
+                "Reset next " + scope.displayName() + " incident ID",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (choice != JOptionPane.OK_OPTION) {
+            return;
+        }
+        if (!"RESET ID".equals(phrase.getText().strip())) {
+            JOptionPane.showMessageDialog(this, "Nothing changed. The confirmation phrase did not match.",
+                    "Reset next ID cancelled", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        trigger.setEnabled(false);
+        actions.resetNextIncidentId(scope).whenComplete((ignored, failure) ->
+                SwingUtilities.invokeLater(() -> trigger.setEnabled(true)));
     }
 
     private Incident focusedIncident(JTable table) {

@@ -538,6 +538,31 @@ public final class DashboardController implements DashboardActions {
     }
 
     @Override
+    public CompletableFuture<Boolean> resetNextIncidentId(ArchiveScope scope) {
+        ArchiveScope safeScope = scope == null ? ArchiveScope.RECORDED : scope;
+        return repositoryFor(safeScope).resetNextIncidentIdIfEmpty().whenComplete((reset, failure) -> {
+            if (failure != null) {
+                showFailure("Reset next incident ID", failure);
+                return;
+            }
+            if (!Boolean.TRUE.equals(reset)) {
+                onEdt(() -> view.showInfo("Cannot reset the next "
+                        + safeScope.displayName().toLowerCase()
+                        + " ID while that archive still contains incident records. "
+                        + "No records or media were changed."));
+                return;
+            }
+            if (safeScope == ArchiveScope.UPLOADED) {
+                refreshUploadedIncidents();
+            } else {
+                refreshIncidents();
+            }
+            onEdt(() -> view.showInfo("The next " + safeScope.displayName().toLowerCase()
+                    + " incident ID will be 1. No records or media were changed."));
+        });
+    }
+
+    @Override
     public void saveSettings(EngineSettings newSettings) {
         settingsStore.save(newSettings).whenComplete((saved, failure) -> {
             if (failure != null) {

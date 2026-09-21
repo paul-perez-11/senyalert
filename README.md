@@ -102,7 +102,7 @@ the matching profile in SenyAlert for portrait-friendly defaults.
 1. Connect the phone through USB and enable its native **Webcam** / **USB
    Webcam** mode if the device provides it. Confirm that Windows' Camera app
    can see it.
-2. In **Cameras**, use **Add camera**, choose **Phone camera (front) (demo)**
+2. In **Cameras**, use **Add camera**, choose **Phone camera (front(demo)**
    or **Phone camera (rear) (demo)**, and set a source such as `uvc://0`.
    The number is the Windows/OpenCV camera index; try the next index if `0` is
    the laptop webcam. Save the camera changes.
@@ -143,7 +143,7 @@ has lower frame rate and higher latency than the raw USB/UVC route above.
 
 For Android IP Camera, the **Cameras** tab now has an optional **Android IP
 Camera controls** section on every camera tab. Enter the wireless ADB target
-(for example `192.168.68.113:42573`) or an already-authorized USB serial, the
+(for example `192.168.68.113:42573`or an already-authorized USB serial, the
 laptop listening port, and the phone camera server port. **Connect & forward**
 runs the equivalent safe argument-based ADB commands in the background; **Use
 forwarded stream** fills in `http://127.0.0.1:<laptop-port>/video/mjpeg` for
