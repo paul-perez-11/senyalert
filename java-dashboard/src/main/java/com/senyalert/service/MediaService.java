@@ -64,6 +64,11 @@ public final class MediaService {
                             Path source = fallbackPath(value);
                             Files.copy(source, destination, StandardCopyOption.COPY_ATTRIBUTES);
                         }
+                        Path sidecars = destination.resolveSibling(destination.getFileName() + "-record-" + java.util.UUID.randomUUID());
+                        Files.createDirectory(sidecars);
+                        org.json.JSONObject report = IncidentReport.json(value);
+                        Files.writeString(sidecars.resolve("record-data.json"), report.toString(2));
+                        Files.writeString(sidecars.resolve("record-data.txt"), IncidentReport.text(report));
                     } catch (IOException exportFailure) {
                         throw new IllegalStateException("Could not export the incident video", exportFailure);
                     }
@@ -130,10 +135,10 @@ public final class MediaService {
                 Incident incident = evidence.incident();
                 Path incidentDirectory = output.resolve("incident-" + incident.id());
                 Files.createDirectories(incidentDirectory);
-                if (mode == ArchiveExportMode.RECORD_BUNDLE) {
-                    Files.writeString(incidentDirectory.resolve("incident-report.txt"), formatReport(evidence));
-                    reports++;
-                }
+                org.json.JSONObject report = IncidentReport.json(evidence);
+                Files.writeString(incidentDirectory.resolve("record-data.json"), report.toString(2));
+                Files.writeString(incidentDirectory.resolve("record-data.txt"), IncidentReport.text(report));
+                reports++;
                 if (mode == ArchiveExportMode.RECORD_BUNDLE
                         || mode == ArchiveExportMode.SNAPSHOTS
                         || mode == ArchiveExportMode.MEDIA) {

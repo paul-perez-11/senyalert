@@ -71,15 +71,41 @@ ground-truth event-evaluation tools are documented in
 and a scope-labelled JSON summary; synthetic queue results and local component
 timings must not be presented as real camera-to-alert latency.
 
+## Local sign-in and remote support
+
+SenyAlert now requires a local account. The first launch creates the first
+local administrator; administrators can create users and assign individual
+permissions. The reserved `superadmin` login opens the separate SenyAlert
+Superadmin Dashboard only when its password verifier is configured on the
+developer computer.
+
+Remote Support is client-initiated, temporary, and logged. It requires a local
+`cloudflared` installation and a separately provisioned per-client support
+key; the copied support link by itself is not enough to connect. Read
+[docs/remote-support.md](docs/remote-support.md) before configuring or using a
+client session. Local role setup and the append-only audit history are covered
+in [docs/access-and-audit.md](docs/access-and-audit.md).
+
+Use the documented [environment configuration](docs/environment-setup.md) for
+per-installation paths, client identity, Remote Support values, portable camera
+sources, and the managed engine startup option. Copy `senyalert.env.example` to
+`senyalert.env`; never put the real file under version control.
+
 ## Run the local demo
 
 ```powershell
 python senyalert.py run
 ```
 
-The launcher starts the Python engine first and then the Java dashboard. The
-dashboard listens on `ws://localhost:8080`; the engine reconnects until it is
-available. Do not use Maven's `clean` phase for normal demo starts.
+The launcher opens the Java sign-in screen first. After a normal user or
+administrator successfully signs in and the dashboard is visible, SenyAlert
+starts the Python ingestion engine it owns. Closing or signing out stops that
+owned process and its descendants, then closes the dashboard's local server.
+The dashboard listens on `ws://localhost:8080`; the engine reconnects until it
+is available. Do not use Maven's `clean` phase for normal demo starts.
+
+Set `SENYALERT_ENGINE_AUTOSTART=false` only when you deliberately run a
+separate local engine. SenyAlert does not stop a separately started process.
 
 If you prefer to start the dashboard separately:
 

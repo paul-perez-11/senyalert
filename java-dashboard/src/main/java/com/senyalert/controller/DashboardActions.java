@@ -15,6 +15,16 @@ import java.util.concurrent.CompletableFuture;
 
 /** User intents emitted by the Swing view. */
 public interface DashboardActions {
+    default boolean can(com.senyalert.security.Permission permission) { return false; }
+
+    default void copyRecordData(ArchiveScope scope, long id) { }
+
+    default void copySnapshot(ArchiveScope scope, long id) { }
+
+    default void exportConfiguration(Path destination, boolean camerasOnly) { }
+
+    default void importConfiguration(Path source, boolean camerasOnly) { }
+
     void refreshIncidents();
 
     void selectIncident(long incidentId);

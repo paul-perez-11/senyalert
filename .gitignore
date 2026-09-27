@@ -18,10 +18,40 @@
 /java-dashboard/evidence-cache/
 /java-dashboard/uploaded-evidence-cache/
 /java-dashboard/senyalert-config.json
+/senyalert.env
+/java-dashboard/senyalert.env
 
 # Python bytecode caches
 __pycache__/
 *.py[cod]
+/.venv/
 scc.exe
 java-dashboard/senyalert-config.json
 /Research-Data
+
+# Local security state and recoverable per-installation configuration
+/java-dashboard/security.db*
+/java-dashboard/superadmin-dashboard.db*
+/java-dashboard/client-id.txt
+/java-dashboard/config-backups/
+/java-dashboard/audit-reset-archives/
+/java-dashboard/senyalert-config.json.*.pending
+
+# Operator-generated exports, support backups, and local preservation snapshots
+/java-dashboard/exports/
+/java-dashboard/support-backups/
+/data-preservation-snapshots/
+
+# Local runtime logs and Cloudflare credentials/binaries
+*.log
+/.cloudflared/
+/cloudflared
+/cloudflared*.exe
+
+# IDE and operating-system metadata
+/.idea/
+/.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+Desktop.ini

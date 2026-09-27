@@ -533,6 +533,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
          "detection_source", "repeated_handsign", "repetition_cycle_count"],
         detection_rows,
     )
+    if measured_frames == 0:
+        failures.append("No frames remained after warm-up. Use a longer clip/trial or reduce warm-up frames.")
     report: Dict[str, Any] = {
         "benchmark": "python_vision_pipeline",
         "run_directory": str(run_directory),
@@ -932,8 +934,20 @@ def run_summarize(args: argparse.Namespace) -> int:
             if candidate.name == "chapter-summary.json":
                 continue
             try:
+                # GUI manifests distinguish complete trials from cancelled or
+                # failed runs whose partial outputs must not enter Chapter 4.
+                trial_manifest = next(
+                    (parent / "trial.json" for parent in candidate.parents
+                     if (parent / "trial.json").is_file()), None
+                )
+                if trial_manifest is not None:
+                    trial = json.loads(trial_manifest.read_text(encoding="utf-8"))
+                    if trial.get("status") != "COMPLETED":
+                        continue
                 payload = json.loads(candidate.read_text(encoding="utf-8"))
-                if isinstance(payload, dict) and payload.get("benchmark"):
+                if (isinstance(payload, dict) and payload.get("benchmark")
+                        and not payload.get("errors")
+                        and payload.get("all_operations_completed", True)):
                     reports.append((candidate, payload))
             except (OSError, json.JSONDecodeError):
                 continue

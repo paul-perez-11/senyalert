@@ -10,6 +10,7 @@ import com.senyalert.model.MediaDeletionOptions;
 import com.senyalert.model.OperatorIncidentUpdate;
 import com.senyalert.view.ui.BlueTheme;
 import com.senyalert.view.ui.EmptyStateTable;
+import com.senyalert.view.ui.NativeFileDialogs;
 import com.senyalert.view.ui.RoundedPanel;
 import com.senyalert.view.ui.StyledButton;
 import java.awt.BorderLayout;
@@ -23,11 +24,11 @@ import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Predicate;
 import javax.swing.BorderFactory;
 import javax.swing.ButtonGroup;
 import javax.swing.JCheckBox;
 import javax.swing.JComboBox;
-import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
@@ -50,6 +51,12 @@ final class EvidenceArchivePanel extends JPanel {
     private final IncidentTableModel archiveModel = new IncidentTableModel(true);
     private DashboardActions actions;
     private IncidentViewerDialog viewer;
+    private Predicate<com.senyalert.security.Permission> allowed = ignored -> false;
+    private StyledButton viewButton;
+    private StyledButton bulkUpdateButton;
+    private StyledButton exportAllButton;
+    private StyledButton deleteAllButton;
+    private StyledButton resetNextIdButton;
 
     EvidenceArchivePanel(ArchiveScope scope) {
         this.scope = scope == null ? ArchiveScope.RECORDED : scope;
@@ -69,6 +76,19 @@ final class EvidenceArchivePanel extends JPanel {
 
     void setActions(DashboardActions actions) {
         this.actions = actions;
+        applyPermissionState();
+    }
+
+    /** Keeps records visible to reviewers while withholding actions outside their assigned grants. */
+    void setPermissions(Predicate<com.senyalert.security.Permission> allowed) {
+        this.allowed = allowed == null ? ignored -> false : allowed;
+        applyPermissionState();
+        if (viewer != null && viewer.isDisplayable() && actions != null) {
+            viewer.setCopyActions(
+                    id -> actions.copyRecordData(scope, id),
+                    id -> actions.copySnapshot(scope, id),
+                    this.allowed);
+        }
     }
 
     void showIncidents(List<Incident> incidents) {
@@ -112,6 +132,10 @@ final class EvidenceArchivePanel extends JPanel {
                         }
                     });
         }
+        viewer.setCopyActions(
+                id -> { if (actions != null) actions.copyRecordData(scope, id); },
+                id -> { if (actions != null) actions.copySnapshot(scope, id); },
+                allowed);
         viewer.showEvidence(evidence);
     }
 
@@ -161,33 +185,34 @@ final class EvidenceArchivePanel extends JPanel {
 
     private JPanel buildToolbar(JTable table, boolean includeBulkUpdate) {
         JPanel toolbar = transparent(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0));
-        StyledButton view = new StyledButton("View / update", FontAwesomeSolid.DATABASE, BlueTheme.PRIMARY);
-        view.addActionListener(event -> openForView(table));
+        viewButton = new StyledButton("View / update", FontAwesomeSolid.DATABASE, BlueTheme.PRIMARY);
+        viewButton.addActionListener(event -> openForView(table));
         StyledButton selectAll = new StyledButton("Select all", FontAwesomeSolid.CHECK, BlueTheme.DEEP_BLUE);
         selectAll.addActionListener(event -> archiveModel.setAllSelected(true));
         StyledButton clearSelection = new StyledButton("Clear", null, BlueTheme.DEEP_BLUE);
         clearSelection.addActionListener(event -> archiveModel.setAllSelected(false));
-        toolbar.add(view);
+        toolbar.add(viewButton);
         toolbar.add(selectAll);
         toolbar.add(clearSelection);
 
         if (includeBulkUpdate) {
-            StyledButton bulkUpdate = new StyledButton("Update selected", FontAwesomeSolid.CHECK, BlueTheme.SUCCESS);
-            bulkUpdate.addActionListener(event -> showBulkUpdateDialog());
-            toolbar.add(bulkUpdate);
+            bulkUpdateButton = new StyledButton("Update selected", FontAwesomeSolid.CHECK, BlueTheme.SUCCESS);
+            bulkUpdateButton.addActionListener(event -> showBulkUpdateDialog());
+            toolbar.add(bulkUpdateButton);
         }
-        StyledButton exportAll = new StyledButton("Export complete bundle…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
-        exportAll.setToolTipText("Exports the record report plus every available snapshot and video for checked records, or all records when none are checked.");
-        exportAll.addActionListener(event -> chooseArchiveExport());
-        StyledButton deleteAll = new StyledButton("Delete all…", FontAwesomeSolid.EXCLAMATION_TRIANGLE, BlueTheme.DANGER);
-        deleteAll.setToolTipText("Deletes checked records, or requires a typed confirmation to remove all archive database records.");
-        deleteAll.addActionListener(event -> confirmArchiveDelete());
-        StyledButton resetNextId = new StyledButton("Reset next ID…", FontAwesomeSolid.SYNC, BlueTheme.DEEP_BLUE);
-        resetNextId.setToolTipText("Does not delete records or media. Available only when this archive is empty.");
-        resetNextId.addActionListener(event -> confirmResetNextId(resetNextId));
-        toolbar.add(exportAll);
-        toolbar.add(deleteAll);
-        toolbar.add(resetNextId);
+        exportAllButton = new StyledButton("Export complete bundle…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
+        exportAllButton.setToolTipText("Exports JSON and plaintext record data plus every available snapshot and video for checked records, or all records when none are checked.");
+        exportAllButton.addActionListener(event -> chooseArchiveExport());
+        deleteAllButton = new StyledButton("Delete all…", FontAwesomeSolid.EXCLAMATION_TRIANGLE, BlueTheme.DANGER);
+        deleteAllButton.setToolTipText("Deletes checked records, or requires a typed confirmation to remove all archive database records.");
+        deleteAllButton.addActionListener(event -> confirmArchiveDelete());
+        resetNextIdButton = new StyledButton("Reset next ID…", FontAwesomeSolid.SYNC, BlueTheme.DEEP_BLUE);
+        resetNextIdButton.setToolTipText("Does not delete records or media. Available only when this archive is empty.");
+        resetNextIdButton.addActionListener(event -> confirmResetNextId(resetNextIdButton));
+        toolbar.add(exportAllButton);
+        toolbar.add(deleteAllButton);
+        toolbar.add(resetNextIdButton);
+        applyPermissionState();
         return toolbar;
     }
 
@@ -267,12 +292,28 @@ final class EvidenceArchivePanel extends JPanel {
             }
         });
         JMenuItem acknowledge = new JMenuItem("Mark acknowledged");
+        acknowledge.setEnabled(can(com.senyalert.security.Permission.ACKNOWLEDGE_INCIDENTS));
+        acknowledge.setToolTipText(can(com.senyalert.security.Permission.ACKNOWLEDGE_INCIDENTS)
+                ? "Mark the selected incident as acknowledged."
+                : "Requires the Acknowledge incidents permission.");
         acknowledge.addActionListener(event -> updateFocusedStatus(table, IncidentStatus.ACKNOWLEDGED));
         JMenuItem resolve = new JMenuItem("Mark resolved");
+        resolve.setEnabled(can(com.senyalert.security.Permission.RESOLVE_INCIDENTS));
+        resolve.setToolTipText(can(com.senyalert.security.Permission.RESOLVE_INCIDENTS)
+                ? "Mark the selected incident as resolved."
+                : "Requires the Resolve incidents permission.");
         resolve.addActionListener(event -> updateFocusedStatus(table, IncidentStatus.RESOLVED));
         JMenuItem export = new JMenuItem("Export record bundle…");
+        export.setEnabled(can(com.senyalert.security.Permission.EXPORT_EVIDENCE));
+        export.setToolTipText(can(com.senyalert.security.Permission.EXPORT_EVIDENCE)
+                ? "Export the selected record's JSON, plaintext, and available media."
+                : "Requires the Export evidence permission.");
         export.addActionListener(event -> exportFocused(table));
         JMenuItem delete = new JMenuItem("Delete database record…");
+        delete.setEnabled(can(com.senyalert.security.Permission.DELETE_RECORDS));
+        delete.setToolTipText(can(com.senyalert.security.Permission.DELETE_RECORDS)
+                ? "Delete the selected local database record after confirmation."
+                : "Requires the Delete records permission.");
         delete.addActionListener(event -> deleteFocused(table));
         menu.add(view);
         menu.add(toggle);
@@ -325,20 +366,34 @@ final class EvidenceArchivePanel extends JPanel {
     }
 
     private void showBulkUpdateDialog() {
+        if (!canArchiveUpdate()) {
+            return;
+        }
         List<Incident> selected = archiveModel.selectedIncidents();
         if (selected.isEmpty()) {
             JOptionPane.showMessageDialog(this, "Check one or more records first.", "Bulk update", JOptionPane.INFORMATION_MESSAGE);
             return;
         }
-        JComboBox<String> statusChoice = new JComboBox<>(new String[] {
-                "Keep existing status", IncidentStatus.PENDING.name(), IncidentStatus.ACKNOWLEDGED.name(), IncidentStatus.RESOLVED.name()
-        });
+        java.util.ArrayList<String> statusChoices = new java.util.ArrayList<>();
+        statusChoices.add("Keep existing status");
+        if (can(com.senyalert.security.Permission.ACKNOWLEDGE_INCIDENTS)) {
+            statusChoices.add(IncidentStatus.ACKNOWLEDGED.name());
+        }
+        if (can(com.senyalert.security.Permission.RESOLVE_INCIDENTS)) {
+            statusChoices.add(IncidentStatus.RESOLVED.name());
+        }
+        JComboBox<String> statusChoice = new JComboBox<>(statusChoices.toArray(String[]::new));
         JCheckBox replaceNotes = new JCheckBox("Replace operator note for every selected record");
+        boolean canEditNotes = can(com.senyalert.security.Permission.EDIT_NOTES);
+        replaceNotes.setEnabled(canEditNotes);
+        replaceNotes.setToolTipText(canEditNotes
+                ? "Replace the operator note for every selected record."
+                : "Requires the Edit incident notes permission.");
         JTextArea notes = new JTextArea(4, 34);
         notes.setLineWrap(true);
         notes.setWrapStyleWord(true);
         notes.setEnabled(false);
-        replaceNotes.addActionListener(event -> notes.setEnabled(replaceNotes.isSelected()));
+        replaceNotes.addActionListener(event -> notes.setEnabled(canEditNotes && replaceNotes.isSelected()));
 
         JPanel form = transparent(new BorderLayout(0, 8));
         form.add(new JLabel("Updating " + selected.size() + " selected record(s)."), BorderLayout.NORTH);
@@ -383,13 +438,9 @@ final class EvidenceArchivePanel extends JPanel {
         if (actions == null) {
             return;
         }
-        JFileChooser chooser = new JFileChooser();
-        chooser.setDialogTitle("Choose an export folder");
-        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-        chooser.setAcceptAllFileFilterUsed(false);
-        if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
-            actions.exportArchive(scope, ids, chooser.getSelectedFile().toPath(), mode);
-        }
+        NativeFileDialogs.chooseDirectory(this, "Choose an evidence export folder",
+                com.senyalert.service.ExportDefaults.Kind.EVIDENCE)
+                .ifPresent(destination -> actions.exportArchive(scope, ids, destination, mode));
     }
 
     private void confirmArchiveDelete() {
@@ -483,6 +534,52 @@ final class EvidenceArchivePanel extends JPanel {
             return null;
         }
         return archiveModel.incidentAt(table.convertRowIndexToModel(selectedRow));
+    }
+
+    private void applyPermissionState() {
+        setPermissionState(
+                viewButton,
+                can(com.senyalert.security.Permission.VIEW_INCIDENTS),
+                "Open the selected incident's read-only record and available workflow fields.",
+                "Requires the View and select incidents permission.");
+        setPermissionState(
+                bulkUpdateButton,
+                canArchiveUpdate(),
+                "Update selected records using only the status and note changes this account can make.",
+                "Requires incident acknowledge, resolve, or note-edit permission.");
+        setPermissionState(
+                exportAllButton,
+                can(com.senyalert.security.Permission.EXPORT_EVIDENCE),
+                "Export JSON and plaintext record data plus available snapshot and video files.",
+                "Requires the Export evidence permission.");
+        setPermissionState(
+                deleteAllButton,
+                can(com.senyalert.security.Permission.DELETE_RECORDS),
+                "Delete selected records, or type a confirmation phrase to delete every archive record.",
+                "Requires the Delete records permission.");
+        setPermissionState(
+                resetNextIdButton,
+                can(com.senyalert.security.Permission.DELETE_RECORDS),
+                "Reset the next incident ID only after the archive is empty and you confirm the phrase.",
+                "Requires the Delete records permission.");
+    }
+
+    private boolean canArchiveUpdate() {
+        return can(com.senyalert.security.Permission.ACKNOWLEDGE_INCIDENTS)
+                || can(com.senyalert.security.Permission.RESOLVE_INCIDENTS)
+                || can(com.senyalert.security.Permission.EDIT_NOTES);
+    }
+
+    private boolean can(com.senyalert.security.Permission permission) {
+        return allowed.test(permission);
+    }
+
+    private static void setPermissionState(StyledButton button, boolean permitted, String enabledHint, String deniedHint) {
+        if (button == null) {
+            return;
+        }
+        button.setEnabled(permitted);
+        button.setToolTipText(permitted ? enabledHint : deniedHint);
     }
 
     private static JPanel transparent(java.awt.LayoutManager layout) {

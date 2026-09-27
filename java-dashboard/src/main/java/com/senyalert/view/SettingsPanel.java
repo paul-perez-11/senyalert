@@ -12,6 +12,7 @@ import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.util.List;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import javax.swing.BorderFactory;
 import javax.swing.JCheckBox;
 import javax.swing.JLabel;
@@ -57,6 +58,7 @@ final class SettingsPanel extends JPanel {
     private Runnable pauseAction = () -> { };
     private Runnable restartAction = () -> { };
     private List<CameraSettings> configuredCameras = EngineSettings.defaults().cameras();
+    private Predicate<com.senyalert.security.Permission> allowed = ignored -> false;
 
     SettingsPanel() {
         setLayout(new BorderLayout());
@@ -152,6 +154,38 @@ final class SettingsPanel extends JPanel {
         this.saveAction = saveAction;
         this.pauseAction = pauseAction;
         this.restartAction = restartAction;
+    }
+
+    /** Leaves the saved configuration readable while preventing an ungranted session from changing it. */
+    void setPermissions(Predicate<com.senyalert.security.Permission> allowed) {
+        this.allowed = allowed == null ? ignored -> false : allowed;
+        boolean canConfigure = canConfigureEngine();
+        confidence.setEnabled(canConfigure);
+        gestureSensitivity.setEnabled(canConfigure);
+        repeatedHandsignMinimum.setEnabled(canConfigure);
+        repeatedHandsignTarget.setEnabled(canConfigure);
+        preEvent.setEnabled(canConfigure);
+        postEvent.setEnabled(canConfigure);
+        requireThumb.setEnabled(canConfigure);
+        requireIndex.setEnabled(canConfigure);
+        maxHands.setEnabled(canConfigure);
+        peopleEnabled.setEnabled(canConfigure);
+        audibleEnabled.setEnabled(canConfigure);
+        saveButton.setEnabled(canConfigure);
+        pauseButton.setEnabled(canConfigure);
+        restartButton.setEnabled(canConfigure);
+        String denied = "Requires the Configure engine settings permission.";
+        saveButton.setToolTipText(canConfigure
+                ? "Save the displayed engine settings and apply them to the connected engine."
+                : denied);
+        pauseButton.setToolTipText(canConfigure
+                ? "Pause or resume incident detection in the connected engine."
+                : denied);
+        restartButton.setToolTipText(canConfigure
+                ? "Reconnect enabled camera workers without deleting evidence or changing saved settings."
+                : denied);
+        updatePeopleControlState();
+        updateFingerBonusControlState();
     }
 
     void showSettings(EngineSettings settings) {
@@ -286,10 +320,9 @@ final class SettingsPanel extends JPanel {
     }
 
     private void updatePeopleControlState() {
-        boolean enabled = peopleEnabled.isSelected();
+        boolean enabled = canConfigureEngine() && peopleEnabled.isSelected();
         peopleInterval.setEnabled(enabled);
         quietThreshold.setEnabled(enabled);
-        quietThresholdValue.setEnabled(enabled);
     }
 
     private void updateGestureSensitivityLabel() {
@@ -307,15 +340,17 @@ final class SettingsPanel extends JPanel {
 
     /** Preserve the configured value, but do not offer an inapplicable credit control. */
     private void updateFingerBonusControlState() {
-        boolean thumbRequired = requireThumb.isSelected();
+        boolean thumbRequired = canConfigureEngine() && requireThumb.isSelected();
         thumbTuckBonus.setEnabled(thumbRequired);
-        thumbTuckBonusValue.setEnabled(thumbRequired);
-        thumbTuckBonusValue.setText(thumbRequired ? thumbTuckBonus.getValue() + "%" : "Not used");
+        thumbTuckBonusValue.setText(requireThumb.isSelected() ? thumbTuckBonus.getValue() + "%" : "Not used");
 
-        boolean indexRequired = requireIndex.isSelected();
+        boolean indexRequired = canConfigureEngine() && requireIndex.isSelected();
         indexFoldBonus.setEnabled(indexRequired);
-        indexFoldBonusValue.setEnabled(indexRequired);
-        indexFoldBonusValue.setText(indexRequired ? indexFoldBonus.getValue() + "%" : "Not used");
+        indexFoldBonusValue.setText(requireIndex.isSelected() ? indexFoldBonus.getValue() + "%" : "Not used");
+    }
+
+    private boolean canConfigureEngine() {
+        return allowed.test(com.senyalert.security.Permission.CONFIGURE_ENGINE);
     }
 
     private static RoundedPanel card() {

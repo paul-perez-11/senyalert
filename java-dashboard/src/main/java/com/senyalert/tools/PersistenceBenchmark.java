@@ -112,6 +112,9 @@ public final class PersistenceBenchmark {
             System.out.println("Samples: " + csvPath);
             System.out.println("Summary: " + jsonPath);
             System.out.println("Test database: " + databasePath);
+            if (!allCompleted || !failures.isEmpty()) {
+                throw new IllegalStateException("Persistence benchmark has incomplete or failed operations; inspect the saved summary.");
+            }
         } finally {
             executors.close();
         }

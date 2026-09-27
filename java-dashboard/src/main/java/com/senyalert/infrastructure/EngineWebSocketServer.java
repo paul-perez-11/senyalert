@@ -30,7 +30,7 @@ public class EngineWebSocketServer extends WebSocketServer implements EngineGate
     private final Set<WebSocket> benchmarkConnections = ConcurrentHashMap.newKeySet();
 
     public EngineWebSocketServer(int port, DashboardController controller) {
-        super(new InetSocketAddress(port));
+        super(new InetSocketAddress("127.0.0.1", port));
         this.controller = controller;
     }
 
@@ -139,7 +139,12 @@ public class EngineWebSocketServer extends WebSocketServer implements EngineGate
 
     @Override
     public boolean sendSettings(EngineSettings settings) {
-        return sendCommand(new JSONObject().put("action", "UPDATE_SETTINGS").put("config", settings.toEngineJson()));
+        try {
+            return sendCommand(new JSONObject().put("action", "UPDATE_SETTINGS").put("config", com.senyalert.service.ConfigurationFiles.resolveCameraEnvironment(settings.toEngineJson())));
+        } catch (RuntimeException invalid) {
+            controller.onEngineStatus(new EngineStatus(isConnected(), false, invalid.getMessage(), ""));
+            return false;
+        }
     }
 
     @Override

@@ -10,6 +10,7 @@ import com.senyalert.model.IncidentEvidence;
 import com.senyalert.model.UploadedVideoStatus;
 import com.senyalert.view.ui.BlueTheme;
 import com.senyalert.view.ui.EmptyStateTable;
+import com.senyalert.view.ui.NativeFileDialogs;
 import com.senyalert.view.ui.RoundedPanel;
 import com.senyalert.view.ui.StyledButton;
 import java.awt.BorderLayout;
@@ -17,6 +18,9 @@ import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.GridLayout;
+import java.awt.Rectangle;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.util.List;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
@@ -32,6 +36,7 @@ import javax.swing.ListSelectionModel;
 import javax.swing.JOptionPane;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 import javax.swing.event.ListSelectionEvent;
 import org.kordamp.ikonli.Ikon;
 import org.kordamp.ikonli.fontawesome6.FontAwesomeSolid;
@@ -46,14 +51,14 @@ public class DashboardFrame extends JFrame implements DashboardView {
             "Loading the incident queue",
             "Checking recent events in the local incident store.");
     private final AlertBanner alertBanner = new AlertBanner();
+    private final LivePreviewPanel livePreview = new LivePreviewPanel();
+    private final DispatchActionPanel dispatchActions = new DispatchActionPanel();
     private final EvidencePanel evidencePanel = new EvidencePanel();
     private final EvidenceArchivePanel evidenceArchivePanel = new EvidenceArchivePanel(ArchiveScope.RECORDED);
-    private final EvidenceArchivePanel uploadedEvidenceArchivePanel = new EvidenceArchivePanel(ArchiveScope.UPLOADED);
-    private final CameraPreviewGrid previewGrid = new CameraPreviewGrid();
     private final SettingsPanel settingsPanel = new SettingsPanel();
     private final CameraManagementPanel cameraManagementPanel = new CameraManagementPanel();
-    private final VideoUploadPanel videoUploadPanel = new VideoUploadPanel();
     private final JTabbedPane tabs = new JTabbedPane();
+    private final JTabbedPane settingsTabs = new JTabbedPane();
     private final JLabel engineStatus = new JLabel("Starting dashboard…");
     private final JLabel cameraStatus = new JLabel("Camera: awaiting engine");
     private final JLabel activeMetric = new JLabel("0");
@@ -63,15 +68,31 @@ public class DashboardFrame extends JFrame implements DashboardView {
     private final JButton dispatchPreviousPage = paginationButton("‹ Previous");
     private final JButton dispatchNextPage = paginationButton("Next ›");
     private final JLabel dispatchPageStatus = new JLabel();
+    private final Timer dispatchRefreshTimer = new Timer(15_000, event -> refreshLiveDispatch());
+    private JButton cameraExportConfiguration;
+    private JButton cameraImportConfiguration;
+    private JButton engineExportConfiguration;
+    private JButton engineImportConfiguration;
     private DashboardActions actions;
+    private long selectedDispatchIncidentId = -1L;
+    private boolean synchronizingDispatchSelection;
+    private int liveDispatchTabIndex;
+    private int camerasTabIndex;
+    private int evidenceArchiveTabIndex;
+    private int settingsTabIndex;
+    private int engineSettingsTabIndex;
 
     public DashboardFrame() {
         setTitle("SenyAlert | Distress Dispatch & Triage");
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        // Closing a signed-in window returns to the local sign-in dialog, where
+        // Exit performs the complete application shutdown.
+        setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
         setMinimumSize(new Dimension(1024, 640));
         setSize(1220, 720);
         setLocationByPlatform(true);
         configureIncidentTable(dispatchTable, false);
+        alertBanner.setSelectionAction(this::selectAlertedIncident);
+        evidencePanel.setDispatchWorkflowControlsVisible(false);
 
         JPanel root = new JPanel(new BorderLayout());
         root.setBackground(BlueTheme.BACKGROUND);
@@ -82,6 +103,17 @@ public class DashboardFrame extends JFrame implements DashboardView {
         setExtendedState(JFrame.MAXIMIZED_BOTH);
         dispatchIncidentModel.addTableModelListener(event -> refreshDispatchPagination());
         refreshDispatchPagination();
+        addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowOpened(WindowEvent event) {
+                dispatchRefreshTimer.start();
+            }
+
+            @Override
+            public void windowClosed(WindowEvent event) {
+                dispatchRefreshTimer.stop();
+            }
+        });
     }
 
     @Override
@@ -99,76 +131,90 @@ public class DashboardFrame extends JFrame implements DashboardView {
                 actions::playVideoNatively,
                 actions::exportVideo);
         evidenceArchivePanel.setActions(actions);
-        uploadedEvidenceArchivePanel.setActions(actions);
-        videoUploadPanel.setSubmitAction(actions::submitUploadedVideo);
+        evidencePanel.setPermissions(actions::can);
+        dispatchActions.setActions(actions);
+        dispatchActions.setPermissions(actions::can);
     }
 
     @Override
     public void showSettings(EngineSettings settings) {
         settingsPanel.showSettings(settings);
         cameraManagementPanel.showSettings(settings);
-        previewGrid.showConfiguredCameras(settings.cameras());
     }
 
     @Override
     public void showIncidents(List<Incident> incidents) {
+        dispatchTable.clearSelection();
         incidentModel.replaceAll(incidents);
         dispatchTable.setEmptyState(
                 "No incidents waiting",
                 "New SOS detections will appear here automatically.");
         evidenceArchivePanel.showIncidents(incidents);
-        dispatchIncidentModel.goToFirstPage();
+        reconcileDispatchSelection();
         updateActiveMetric();
     }
 
     @Override
     public void upsertIncident(Incident incident) {
+        dispatchTable.clearSelection();
         incidentModel.upsert(incident);
         dispatchTable.setEmptyState(
                 "No incidents waiting",
                 "New SOS detections will appear here automatically.");
         evidenceArchivePanel.upsertIncident(incident);
-        dispatchIncidentModel.goToFirstPage();
+        reconcileDispatchSelection();
         updateActiveMetric();
     }
 
     @Override
     public void showUploadedIncidents(List<Incident> incidents) {
-        uploadedEvidenceArchivePanel.showIncidents(incidents);
+        // Historical uploaded data remains on disk.
     }
 
     @Override
     public void upsertUploadedIncident(Incident incident) {
-        uploadedEvidenceArchivePanel.upsertIncident(incident);
+        // Offline analysis no longer appears in the operator dashboard.
     }
 
     @Override
     public void removeIncident(long incidentId) {
         incidentModel.remove(incidentId);
         evidencePanel.clearIfViewing(incidentId);
+        if (selectedDispatchIncidentId == incidentId) {
+            selectedDispatchIncidentId = -1L;
+            dispatchActions.clearSelection();
+            dispatchTable.clearSelection();
+        }
         evidenceArchivePanel.removeIncident(incidentId);
         updateActiveMetric();
     }
 
     @Override
     public void removeUploadedIncident(long incidentId) {
-        uploadedEvidenceArchivePanel.removeIncident(incidentId);
+
     }
 
     @Override
     public void showOperatorRecordUpdated(Incident incident) {
         evidencePanel.showOperatorRecordUpdated(incident);
+        if (dispatchActions.isShowingIncident(incident.id())) {
+            dispatchActions.showIncident(incident);
+        }
         evidenceArchivePanel.showOperatorRecordUpdated(incident);
     }
 
     @Override
     public void showUploadedOperatorRecordUpdated(Incident incident) {
-        uploadedEvidenceArchivePanel.showOperatorRecordUpdated(incident);
+
     }
 
     @Override
     public void showIncidentEvidence(IncidentEvidence evidence) {
         evidencePanel.showEvidence(evidence);
+        // The dispatch thumbnail is deliberately a still image.  When an
+        // operator selects an incident, show that saved snapshot rather than
+        // repainting a continuous camera feed.
+        livePreview.showIncidentSnapshot(evidence);
     }
 
     @Override
@@ -178,11 +224,7 @@ public class DashboardFrame extends JFrame implements DashboardView {
 
     @Override
     public void showArchiveIncidentEvidence(ArchiveScope scope, IncidentEvidence evidence) {
-        if (scope == ArchiveScope.UPLOADED) {
-            uploadedEvidenceArchivePanel.showEvidence(evidence);
-        } else {
-            evidenceArchivePanel.showEvidence(evidence);
-        }
+        if (scope != ArchiveScope.UPLOADED) evidenceArchivePanel.showEvidence(evidence);
     }
 
     @Override
@@ -218,12 +260,12 @@ public class DashboardFrame extends JFrame implements DashboardView {
 
     @Override
     public void showCameraPreview(CameraPreviewFrame preview) {
-        previewGrid.showPreview(preview);
+        livePreview.showPreview(preview);
     }
 
     @Override
     public void showUploadedVideoStatus(UploadedVideoStatus status) {
-        videoUploadPanel.showAnalysisStatus(status);
+
     }
 
     @Override
@@ -287,52 +329,186 @@ public class DashboardFrame extends JFrame implements DashboardView {
         tabs.setFont(BlueTheme.font(Font.BOLD, 13));
         tabs.setBackground(BlueTheme.BACKGROUND);
         tabs.setForeground(BlueTheme.TEXT);
+        liveDispatchTabIndex = tabs.getTabCount();
         tabs.addTab(" Live dispatch", FontIcon.of(FontAwesomeSolid.BELL, 16, BlueTheme.PRIMARY), buildDispatchTab());
-        tabs.addTab(" Cameras", FontIcon.of(FontAwesomeSolid.CAMERA, 16, BlueTheme.PRIMARY), cameraManagementPanel);
-        tabs.addTab(" Video analysis", FontIcon.of(FontAwesomeSolid.FILE_VIDEO, 16, BlueTheme.PRIMARY), videoUploadPanel);
-        tabs.addTab(" Evidence archive", FontIcon.of(FontAwesomeSolid.DATABASE, 16, BlueTheme.PRIMARY), buildArchiveTab());
-        tabs.addTab(" Engine settings", FontIcon.of(FontAwesomeSolid.COG, 16, BlueTheme.PRIMARY), settingsPanel);
-        tabs.setToolTipTextAt(0, "Triage the latest SOS detections and inspect current camera snapshots.");
-        tabs.setToolTipTextAt(1, "Add, disable, and tune each camera source independently.");
-        tabs.setToolTipTextAt(2, "Run the same vision pipeline against a selected local demonstration video.");
-        tabs.setToolTipTextAt(3, "Review recorded and uploaded evidence separately.");
-        tabs.setToolTipTextAt(4, "Configure detection, triage, and engine behaviour.");
+        camerasTabIndex = tabs.getTabCount();
+        tabs.addTab(" Cameras", FontIcon.of(FontAwesomeSolid.CAMERA, 16, BlueTheme.PRIMARY), configurationPanel(cameraManagementPanel, true));
+        evidenceArchiveTabIndex = tabs.getTabCount();
+        tabs.addTab(" Evidence archive", FontIcon.of(FontAwesomeSolid.DATABASE, 16, BlueTheme.PRIMARY), evidenceArchivePanel);
+        settingsTabIndex = tabs.getTabCount();
+        tabs.addTab(" Settings", FontIcon.of(FontAwesomeSolid.COGS, 16, BlueTheme.PRIMARY), buildSettingsWorkspace());
+        tabs.setToolTipTextAt(0, "Triage incidents in the full-width queue and inspect current evidence.");
+        tabs.setToolTipTextAt(1, "Manage camera sources and export or import camera settings.");
+        tabs.setToolTipTextAt(2, "Review saved incidents, record data, images and video.");
+        tabs.setToolTipTextAt(settingsTabIndex, "Configure your account, engine, users, and remote support.");
+        tabs.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
         return tabs;
+    }
+
+    private JTabbedPane buildSettingsWorkspace() {
+        settingsTabs.setFont(BlueTheme.font(Font.BOLD, 12));
+        settingsTabs.setBackground(BlueTheme.BACKGROUND);
+        settingsTabs.setForeground(BlueTheme.TEXT);
+        engineSettingsTabIndex = settingsTabs.getTabCount();
+        settingsTabs.addTab(" Engine settings", FontIcon.of(FontAwesomeSolid.COG, 15, BlueTheme.PRIMARY),
+                configurationPanel(settingsPanel, false));
+        settingsTabs.setToolTipTextAt(engineSettingsTabIndex,
+                "Configure detection and engine behavior, or export a setup file.");
+        settingsTabs.setTabLayoutPolicy(JTabbedPane.SCROLL_TAB_LAYOUT);
+        return settingsTabs;
     }
 
     private JPanel buildDispatchTab() {
         JPanel panel = contentPanel();
 
-        JPanel center = new JPanel(new BorderLayout(0, 12));
+        JPanel center = new JPanel(new BorderLayout(0, 8));
         center.setOpaque(false);
         center.add(buildDispatchSummary(), BorderLayout.NORTH);
-        JSplitPane previewAndEvidence = new JSplitPane(JSplitPane.VERTICAL_SPLIT, previewGrid, evidencePanel);
-        // Preview snapshots are situational awareness, while incident evidence and
-        // queue actions need most of the dispatcher's working area.
-        previewAndEvidence.setResizeWeight(0.26);
-        previewAndEvidence.setDividerLocation(0.26);
-        previewAndEvidence.setBorder(BorderFactory.createEmptyBorder());
-        previewAndEvidence.setDividerSize(8);
 
-        JSplitPane split = new JSplitPane(
-                JSplitPane.HORIZONTAL_SPLIT, incidentTableCard("Live incident queue"), previewAndEvidence);
-        split.setResizeWeight(0.66);
-        split.setDividerLocation(0.66);
+        // Dispatch is table-first.  Evidence stays alongside the active queue
+        // so an operator can inspect the saved snapshot and use its media
+        // actions without sacrificing the queue's working area.
+        evidencePanel.setMinimumSize(new Dimension(310, 330));
+        evidencePanel.setPreferredSize(new Dimension(340, 460));
+        evidencePanel.setLiveDispatchActions(dispatchActions);
+        var queue = incidentTableCard("Live incident queue");
+        queue.setMinimumSize(new Dimension(620, 330));
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, queue, evidencePanel);
+        split.setResizeWeight(0.74);
         split.setBorder(BorderFactory.createEmptyBorder());
-        split.setDividerSize(10);
+        split.setDividerSize(8);
+        split.setContinuousLayout(true);
+        SwingUtilities.invokeLater(() -> split.setDividerLocation(0.74));
         center.add(split, BorderLayout.CENTER);
         panel.add(center, BorderLayout.CENTER);
         return panel;
     }
 
-    private javax.swing.JComponent buildArchiveTab() {
-        JTabbedPane archiveSources = new JTabbedPane();
-        archiveSources.setFont(BlueTheme.font(Font.BOLD, 12));
-        archiveSources.addTab("Recorded", FontIcon.of(FontAwesomeSolid.CAMERA, 14, BlueTheme.PRIMARY), evidenceArchivePanel);
-        archiveSources.addTab("Uploaded", FontIcon.of(FontAwesomeSolid.FILE_VIDEO, 14, BlueTheme.PRIMARY), uploadedEvidenceArchivePanel);
-        archiveSources.setToolTipTextAt(0, "Incidents captured from active camera streams and stored in incidents.db.");
-        archiveSources.setToolTipTextAt(1, "Offline video-analysis results stored separately in uploaded-incidents.db.");
-        return archiveSources;
+    public void addWorkspace(String name, javax.swing.JComponent panel, String hint) {
+        int index = settingsTabIndex;
+        tabs.insertTab(" " + name, FontIcon.of(workspaceIcon(name), 16, BlueTheme.PRIMARY), panel, hint, index);
+        settingsTabIndex++;
+    }
+
+    public void addSettingsWorkspace(String name, javax.swing.JComponent panel, String hint) {
+        settingsTabs.addTab(" " + name, FontIcon.of(settingsWorkspaceIcon(name), 15, BlueTheme.PRIMARY), panel);
+        settingsTabs.setToolTipTextAt(settingsTabs.getTabCount() - 1, hint);
+    }
+
+    public void applyPermissions(com.senyalert.security.SecurityContext context) {
+        cameraManagementPanel.setPermissions(context::can);
+        settingsPanel.setPermissions(context::can);
+        evidencePanel.setPermissions(context::can);
+        evidenceArchivePanel.setPermissions(context::can);
+        dispatchActions.setPermissions(context::can);
+        applyConfigurationPermissions(context);
+        tabs.setEnabledAt(liveDispatchTabIndex, context.can(com.senyalert.security.Permission.VIEW_INCIDENTS));
+        tabs.setEnabledAt(evidenceArchiveTabIndex, context.can(com.senyalert.security.Permission.VIEW_INCIDENTS));
+        boolean cameraAllowed = context.can(com.senyalert.security.Permission.CONFIGURE_CAMERAS)
+                || context.can(com.senyalert.security.Permission.EXPORT_CONFIG);
+        tabs.setEnabledAt(camerasTabIndex, cameraAllowed);
+        boolean engineAllowed = context.can(com.senyalert.security.Permission.CONFIGURE_ENGINE)
+                || context.can(com.senyalert.security.Permission.EXPORT_CONFIG);
+        settingsTabs.setEnabledAt(engineSettingsTabIndex, engineAllowed);
+        // Account remains available to every signed-in person, even if they have no operational grants.
+        tabs.setEnabledAt(settingsTabIndex, true);
+        int selectedSettings = settingsTabs.getSelectedIndex();
+        if (selectedSettings < 0 || !settingsTabs.isEnabledAt(selectedSettings)) {
+            for (int index = 0; index < settingsTabs.getTabCount(); index++) {
+                if (settingsTabs.isEnabledAt(index)) {
+                    settingsTabs.setSelectedIndex(index);
+                    break;
+                }
+            }
+        }
+        for (int index = 0; index < tabs.getTabCount(); index++) if (tabs.isEnabledAt(index)) { tabs.setSelectedIndex(index); break; }
+        setTitle("SenyAlert | " + context.session().username() + " (" + context.session().role() + ")");
+    }
+
+    private static Ikon workspaceIcon(String name) {
+        return switch (name) {
+            case "Benchmarking" -> FontAwesomeSolid.CHART_LINE;
+            case "Audit logs" -> FontAwesomeSolid.CLIPBOARD_LIST;
+            default -> FontAwesomeSolid.FILE;
+        };
+    }
+
+    private static Ikon settingsWorkspaceIcon(String name) {
+        return switch (name) {
+            case "Account" -> FontAwesomeSolid.USER_COG;
+            case "User management" -> FontAwesomeSolid.USERS_COG;
+            case "Remote support" -> FontAwesomeSolid.HEADSET;
+            case "Export settings" -> FontAwesomeSolid.FOLDER_OPEN;
+            default -> FontAwesomeSolid.COG;
+        };
+    }
+
+    private void applyConfigurationPermissions(com.senyalert.security.SecurityContext context) {
+        setPermissionState(
+                cameraExportConfiguration,
+                context.can(com.senyalert.security.Permission.EXPORT_CONFIG),
+                "Export saved camera settings as JSON.",
+                "Requires the Export configuration permission.");
+        setPermissionState(
+                cameraImportConfiguration,
+                context.can(com.senyalert.security.Permission.CONFIGURE_CAMERAS),
+                "Choose a camera-settings JSON file and review it before applying it.",
+                "Requires the Configure cameras permission.");
+        setPermissionState(
+                engineExportConfiguration,
+                context.can(com.senyalert.security.Permission.EXPORT_CONFIG),
+                "Export saved camera and engine settings as JSON.",
+                "Requires the Export configuration permission.");
+        setPermissionState(
+                engineImportConfiguration,
+                context.can(com.senyalert.security.Permission.CONFIGURE_ENGINE),
+                "Choose a configuration JSON file and review it before applying it.",
+                "Requires the Configure engine settings permission.");
+    }
+
+    private static void setPermissionState(JButton button, boolean permitted, String enabledHint, String deniedHint) {
+        if (button == null) {
+            return;
+        }
+        button.setEnabled(permitted);
+        button.setToolTipText(permitted ? enabledHint : deniedHint);
+    }
+
+    private JPanel configurationPanel(javax.swing.JComponent content, boolean camerasOnly) {
+        JPanel wrapper = new JPanel(new BorderLayout());
+        wrapper.add(content, BorderLayout.CENTER);
+        JPanel buttons = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT));
+        JButton export = new StyledButton(camerasOnly ? "Export camera settings…" : "Export configuration…", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
+        JButton load = new StyledButton(camerasOnly ? "Import camera settings…" : "Import configuration…", FontAwesomeSolid.FILE_IMPORT, BlueTheme.DEEP_BLUE);
+        export.setToolTipText("Export saved settings as JSON. Stream credentials are included if present; use env: references for portable templates.");
+        load.setToolTipText("Choose a JSON setup file and review confirmation before applying settings.");
+        if (camerasOnly) {
+            cameraExportConfiguration = export;
+            cameraImportConfiguration = load;
+        } else {
+            engineExportConfiguration = export;
+            engineImportConfiguration = load;
+        }
+        export.addActionListener(e -> {
+            if (actions == null) return;
+            NativeFileDialogs.saveFile(this,
+                    camerasOnly ? "Export camera settings" : "Export SenyAlert configuration",
+                    com.senyalert.service.ExportDefaults.Kind.CONFIGURATION,
+                    camerasOnly ? "senyalert-cameras.json" : "senyalert-config.json",
+                    java.util.List.of("json"))
+                    .ifPresent(destination -> actions.exportConfiguration(destination, camerasOnly));
+        });
+        load.addActionListener(e -> {
+            if (actions == null) return;
+            NativeFileDialogs.openFile(this,
+                    camerasOnly ? "Import camera settings" : "Import SenyAlert configuration",
+                    com.senyalert.service.ExportDefaults.Kind.CONFIGURATION,
+                    java.util.List.of("json"))
+                    .filter(source -> JOptionPane.showConfirmDialog(this, "Apply settings from " + source.getFileName() + "?",
+                            "Import configuration", JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION)
+                    .ifPresent(source -> actions.importConfiguration(source, camerasOnly));
+        });
+        buttons.add(load); buttons.add(export); wrapper.add(buttons, BorderLayout.SOUTH); return wrapper;
     }
 
     private RoundedPanel incidentTableCard(String headingText) {
@@ -343,7 +519,14 @@ public class DashboardFrame extends JFrame implements DashboardView {
         JLabel heading = new JLabel(headingText);
         heading.setFont(BlueTheme.font(Font.BOLD, 16));
         heading.setForeground(BlueTheme.TEXT);
-        card.add(heading, BorderLayout.NORTH);
+        JLabel hint = new JLabel("Pending only · select a row to handle it");
+        hint.setFont(BlueTheme.font(Font.PLAIN, 10));
+        hint.setForeground(BlueTheme.MUTED);
+        JPanel header = new JPanel(new BorderLayout(8, 0));
+        header.setOpaque(false);
+        header.add(heading, BorderLayout.WEST);
+        header.add(hint, BorderLayout.EAST);
+        card.add(header, BorderLayout.NORTH);
         JScrollPane scroll = new JScrollPane(dispatchTable);
         scroll.setBorder(BorderFactory.createLineBorder(BlueTheme.BORDER));
         scroll.getViewport().setBackground(Color.WHITE);
@@ -356,7 +539,10 @@ public class DashboardFrame extends JFrame implements DashboardView {
         table.setFont(BlueTheme.font(Font.PLAIN, 11));
         table.setForeground(BlueTheme.TEXT);
         table.setBackground(Color.WHITE);
-        table.setRowHeight(22);
+        table.setRowHeight(30);
+        table.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
+        int[] widths = {48, 130, 125, 78, 86, 62, 58, 115, 112, 145, 105};
+        for (int index = 0; index < widths.length; index++) { table.getColumnModel().getColumn(index).setPreferredWidth(widths[index]); table.getColumnModel().getColumn(index).setMinWidth(widths[index]); }
         table.setSelectionBackground(new Color(211, 231, 249));
         table.setSelectionForeground(BlueTheme.TEXT);
         table.setGridColor(new Color(229, 237, 246));
@@ -379,7 +565,8 @@ public class DashboardFrame extends JFrame implements DashboardView {
     }
 
     private void selectIncident(ListSelectionEvent event, JTable table, boolean openDispatchForEvidence) {
-        if (event.getValueIsAdjusting() || actions == null || table.getSelectedRow() < 0) {
+        if (event.getValueIsAdjusting() || actions == null || table.getSelectedRow() < 0
+                || (!openDispatchForEvidence && synchronizingDispatchSelection)) {
             return;
         }
         int row = table.convertRowIndexToModel(table.getSelectedRow());
@@ -388,22 +575,90 @@ public class DashboardFrame extends JFrame implements DashboardView {
                 : dispatchIncidentModel.incidentAt(row);
         if (incident != null) {
             if (openDispatchForEvidence) {
-                tabs.setSelectedIndex(0);
+                tabs.setSelectedIndex(liveDispatchTabIndex);
+            } else {
+                selectedDispatchIncidentId = incident.id();
+                dispatchActions.showIncident(incident);
             }
             actions.selectIncident(incident.id());
+        }
+    }
+
+    /** The banner intentionally navigates to the same row an operator would select manually. */
+    private void selectAlertedIncident(long incidentId) {
+        if (actions == null) {
+            return;
+        }
+        int row = dispatchIncidentModel.showIncident(incidentId);
+        if (row < 0) {
+            showInfo("That alert is no longer waiting in the live incident queue.");
+            return;
+        }
+        boolean alreadySelected = selectedDispatchIncidentId == incidentId && dispatchTable.getSelectedRow() == row;
+        dispatchTable.setRowSelectionInterval(row, row);
+        dispatchTable.scrollRectToVisible(dispatchTable.getCellRect(row, 0, true));
+        dispatchTable.requestFocusInWindow();
+        if (alreadySelected) {
+            Incident incident = dispatchIncidentModel.incidentAt(row);
+            if (incident != null) {
+                dispatchActions.showIncident(incident);
+                actions.selectIncident(incident.id());
+            }
+        }
+    }
+
+    /** Keeps the selected active record stable as automatic refreshes replace the source rows. */
+    private void reconcileDispatchSelection() {
+        if (selectedDispatchIncidentId <= 0) {
+            dispatchIncidentModel.goToFirstPage();
+            return;
+        }
+        int row = dispatchIncidentModel.showIncident(selectedDispatchIncidentId);
+        if (row < 0) {
+            selectedDispatchIncidentId = -1L;
+            dispatchActions.clearSelection();
+            return;
+        }
+        synchronizingDispatchSelection = true;
+        try {
+            dispatchTable.setRowSelectionInterval(row, row);
+            Rectangle bounds = dispatchTable.getCellRect(row, 0, true);
+            dispatchTable.scrollRectToVisible(bounds);
+            Incident selected = dispatchIncidentModel.incidentAt(row);
+            if (selected != null) {
+                dispatchActions.showIncident(selected);
+            }
+        } finally {
+            synchronizingDispatchSelection = false;
+        }
+    }
+
+    private void refreshLiveDispatch() {
+        if (actions != null && isShowing() && tabs.getSelectedIndex() == liveDispatchTabIndex) {
+            actions.refreshIncidents();
         }
     }
 
     private JPanel buildDispatchSummary() {
         JPanel summary = new JPanel(new BorderLayout(8, 0));
         summary.setOpaque(false);
+        summary.setMinimumSize(new Dimension(0, 76));
+        summary.setPreferredSize(new Dimension(0, 82));
         summary.add(buildMetricRow(), BorderLayout.CENTER);
-        summary.add(alertBanner, BorderLayout.EAST);
+        alertBanner.setPreferredSize(new Dimension(156, 64));
+        alertBanner.setMinimumSize(new Dimension(148, 60));
+        livePreview.setPreferredSize(new Dimension(184, 74));
+        livePreview.setMinimumSize(new Dimension(172, 70));
+        JPanel alertAndPreview = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.RIGHT, 6, 0));
+        alertAndPreview.setOpaque(false);
+        alertAndPreview.add(alertBanner);
+        alertAndPreview.add(livePreview);
+        summary.add(alertAndPreview, BorderLayout.EAST);
         return summary;
     }
 
     private JPanel buildMetricRow() {
-        JPanel row = new JPanel(new GridLayout(1, 3, 8, 0));
+        JPanel row = new JPanel(new GridLayout(1, 3, 6, 0));
         row.setOpaque(false);
         row.add(metricCard("UNACKNOWLEDGED", activeMetric, BlueTheme.DANGER));
         JLabel mode = new JLabel("Crowd-aware policy", SwingConstants.CENTER);
@@ -419,12 +674,14 @@ public class DashboardFrame extends JFrame implements DashboardView {
         card.setBackground(BlueTheme.CARD);
         card.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(BlueTheme.BORDER),
-                BorderFactory.createEmptyBorder(7, 10, 7, 10)));
+                BorderFactory.createEmptyBorder(5, 8, 4, 8)));
         JLabel label = new JLabel(caption);
         label.setFont(BlueTheme.font(Font.BOLD, 9));
         label.setForeground(BlueTheme.MUTED);
         value.setFont(BlueTheme.font(Font.BOLD, 14));
         value.setForeground(accent);
+        value.setVerticalAlignment(SwingConstants.TOP);
+        value.setBorder(BorderFactory.createEmptyBorder(3, 0, 0, 0));
         card.add(label, BorderLayout.NORTH);
         card.add(value, BorderLayout.CENTER);
         return card;
@@ -483,11 +740,11 @@ public class DashboardFrame extends JFrame implements DashboardView {
                 BorderFactory.createLineBorder(new Color(184, 215, 244)),
                 BorderFactory.createEmptyBorder(4, 8, 4, 8)));
         infoStripContainer.add(infoStrip, BorderLayout.CENTER);
-        footer.add(infoStripContainer, BorderLayout.WEST);
+        footer.add(infoStripContainer, BorderLayout.CENTER);
         JLabel instruction = new JLabel("Select an incident to review its evidence.");
         instruction.setFont(BlueTheme.font(Font.PLAIN, 11));
         instruction.setForeground(BlueTheme.MUTED);
-        footer.add(instruction, BorderLayout.EAST);
+
         return footer;
     }
 

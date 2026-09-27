@@ -21,6 +21,7 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
@@ -64,6 +65,7 @@ final class CameraManagementPanel extends JPanel {
             CompletableFuture.failedFuture(new IllegalStateException(
                     "Camera controls are still starting. Please try again in a moment."));
     private EngineSettings currentSettings = EngineSettings.defaults();
+    private Predicate<com.senyalert.security.Permission> allowed = ignored -> false;
 
     CameraManagementPanel() {
         setLayout(new BorderLayout());
@@ -97,6 +99,26 @@ final class CameraManagementPanel extends JPanel {
             Function<IpCameraZoomRequest, CompletableFuture<String>> zoomAction) {
         this.adbForwardAction = adbForwardAction == null ? this.adbForwardAction : adbForwardAction;
         this.zoomAction = zoomAction == null ? this.zoomAction : zoomAction;
+    }
+
+    /** Shows camera settings to export-only users without allowing a local camera change. */
+    void setPermissions(Predicate<com.senyalert.security.Permission> allowed) {
+        this.allowed = allowed == null ? ignored -> false : allowed;
+        boolean canConfigure = canConfigureCameras();
+        cameraTabs.setToolTipText(canConfigure
+                ? "Choose a camera to review or edit its setup."
+                : "Camera settings are read-only. Requires the Configure cameras permission to make changes.");
+        addCameraButton.setToolTipText(canConfigure
+                ? "Add another camera setup, up to four cameras."
+                : "Requires the Configure cameras permission.");
+        removeCameraButton.setToolTipText(canConfigure
+                ? "Remove the selected camera setup. At least one setup remains required."
+                : "Requires the Configure cameras permission.");
+        saveButton.setToolTipText(canConfigure
+                ? "Save the displayed camera setup and send it to the connected engine."
+                : "Requires the Configure cameras permission.");
+        cameraEditors.forEach(editor -> editor.setEditingEnabled(canConfigure));
+        updateCameraButtons();
     }
 
     void showSettings(EngineSettings settings) {
@@ -241,11 +263,12 @@ final class CameraManagementPanel extends JPanel {
                 this::refreshCameraTabTitles,
                 request -> adbForwardAction.apply(request),
                 request -> zoomAction.apply(request));
+        editor.setEditingEnabled(canConfigureCameras());
         cameraEditors.add(editor);
         JScrollPane editorScroll = new JScrollPane(editor);
         editorScroll.setBorder(BorderFactory.createEmptyBorder());
         editorScroll.getVerticalScrollBar().setUnitIncrement(16);
-        cameraTabs.addTab("Camera", editorScroll);
+        cameraTabs.addTab(" Camera", FontIcon.of(FontAwesomeSolid.CAMERA, 14, BlueTheme.PRIMARY), editorScroll);
         refreshCameraTabTitles();
         if (selectNewCamera) {
             cameraTabs.setSelectedIndex(cameraTabs.getTabCount() - 1);
@@ -316,8 +339,14 @@ final class CameraManagementPanel extends JPanel {
     }
 
     private void updateCameraButtons() {
-        addCameraButton.setEnabled(cameraEditors.size() < MAX_CAMERAS);
-        removeCameraButton.setEnabled(cameraEditors.size() > 1);
+        boolean canConfigure = canConfigureCameras();
+        addCameraButton.setEnabled(canConfigure && cameraEditors.size() < MAX_CAMERAS);
+        removeCameraButton.setEnabled(canConfigure && cameraEditors.size() > 1);
+        saveButton.setEnabled(canConfigure);
+    }
+
+    private boolean canConfigureCameras() {
+        return allowed.test(com.senyalert.security.Permission.CONFIGURE_CAMERAS);
     }
 
     private static CameraSettings defaultCamera(int existingCameraCount) {
@@ -373,6 +402,7 @@ final class CameraManagementPanel extends JPanel {
         private final Function<AndroidIpCameraRequest, CompletableFuture<String>> adbForwardAction;
         private final Function<IpCameraZoomRequest, CompletableFuture<String>> zoomAction;
         private boolean applyingProfile;
+        private boolean editingEnabled;
 
         CameraSetupPanel(
                 CameraSettings camera,
@@ -637,6 +667,31 @@ final class CameraManagementPanel extends JPanel {
             return !adbConnection.getText().trim().isEmpty();
         }
 
+        void setEditingEnabled(boolean editingEnabled) {
+            this.editingEnabled = editingEnabled;
+            enabled.setEnabled(editingEnabled);
+            source.setEnabled(editingEnabled);
+            cameraId.setEnabled(editingEnabled);
+            location.setEnabled(editingEnabled);
+            cameraType.setEnabled(editingEnabled);
+            captureResolution.setEnabled(editingEnabled);
+            processingScale.setEnabled(editingEnabled);
+            previewResolution.setEnabled(editingEnabled);
+            adbConnection.setEnabled(editingEnabled);
+            laptopPort.setEnabled(editingEnabled);
+            phonePort.setEnabled(editingEnabled);
+            connectAndForward.setEnabled(editingEnabled);
+            useForwardedStream.setEnabled(editingEnabled);
+            String denied = "Requires the Configure cameras permission.";
+            connectAndForward.setToolTipText(editingEnabled
+                    ? "Create a local ADB tunnel to the configured Android IP Camera."
+                    : denied);
+            useForwardedStream.setToolTipText(editingEnabled
+                    ? "Use the local forwarded Android IP Camera stream as this camera source."
+                    : denied);
+            updateProfileControls();
+        }
+
         int laptopPortForValidation() {
             return parsePort(laptopPort.getText(), "Laptop listening port");
         }
@@ -683,8 +738,8 @@ final class CameraManagementPanel extends JPanel {
         private void updateProfileControls() {
             CameraSettings.CameraType type = selectedCameraType();
             boolean custom = type == CameraSettings.CameraType.CUSTOM;
-            aspectWidth.setEnabled(custom);
-            aspectHeight.setEnabled(custom);
+            aspectWidth.setEnabled(editingEnabled && custom);
+            aspectHeight.setEnabled(editingEnabled && custom);
             String ratio = type.aspectWidth() + " × " + type.aspectHeight();
             profileHint.setText(custom
                     ? "Custom profile — enter the source's intended aspect above. The engine preserves the actual frame aspect when it opens."
@@ -757,9 +812,13 @@ final class CameraManagementPanel extends JPanel {
 
         private void updateZoomAvailability(CameraSettings.CameraType type) {
             boolean laptopWebcam = type == CameraSettings.CameraType.LAPTOP_WEBCAM;
-            zoom.setEnabled(!laptopWebcam);
-            applyZoom.setEnabled(!laptopWebcam);
-            if (laptopWebcam) {
+            boolean zoomAllowed = editingEnabled && !laptopWebcam;
+            zoom.setEnabled(zoomAllowed);
+            applyZoom.setEnabled(zoomAllowed);
+            if (!editingEnabled) {
+                zoom.setToolTipText("Requires the Configure cameras permission.");
+                applyZoom.setToolTipText("Requires the Configure cameras permission.");
+            } else if (laptopWebcam) {
                 zoom.setToolTipText("Zoom is not available for a Windows laptop webcam. Use the camera app or choose a supported IP camera.");
                 applyZoom.setToolTipText("Zoom is unavailable because this camera uses the Laptop webcam profile.");
                 phoneStatus.setText("Zoom is unavailable for a laptop webcam. Use the Windows Camera controls, or choose a phone/IP-camera profile with remote zoom support.");

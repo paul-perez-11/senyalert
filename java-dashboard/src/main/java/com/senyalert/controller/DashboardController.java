@@ -26,6 +26,11 @@ import com.senyalert.service.EngineGateway;
 import com.senyalert.service.MediaService;
 import com.senyalert.service.SettingsStore;
 import com.senyalert.view.DashboardView;
+import com.senyalert.security.SecurityContext;
+import com.senyalert.security.Permission;
+import com.senyalert.service.IncidentReport;
+import com.senyalert.service.ConfigurationFiles;
+import org.json.JSONObject;
 import java.nio.file.Path;
 import java.nio.file.Files;
 import java.util.ArrayList;
@@ -128,6 +133,130 @@ public final class DashboardController implements DashboardActions {
                 onEdt(() -> view.showError("Alert feedback", message)));
     }
 
+    private SecurityContext security;
+
+    public void attachSecurity(SecurityContext security) { this.security = java.util.Objects.requireNonNull(security); }
+
+    @Override
+    public boolean can(Permission permission) { return security != null && security.can(permission); }
+
+    private boolean begin(Permission permission, String action, String target, String details) {
+        try {
+            if (security == null) throw new SecurityException("Sign in before using this action.");
+            security.beginAction(permission, action, target, details);
+            return true;
+        } catch (RuntimeException denied) {
+            onEdt(() -> view.showError("Action unavailable", denied.getMessage()));
+            return false;
+        }
+    }
+
+    /** Reading saved evidence is permitted at the service boundary but is not itself an audit event. */
+    private boolean permitView(Permission permission) {
+        if (security != null && security.can(permission)) return true;
+        onEdt(() -> view.showError("Action unavailable", "Access denied: " + permission.description() + ". Sign in again if your permissions changed."));
+        return false;
+    }
+
+    private void audit(String action, String target, String details) {
+        if (security != null) security.audit(action, target, details);
+    }
+
+    private boolean permitUpdate(ArchiveScope scope, long id, OperatorIncidentUpdate update) {
+        Incident before = cacheFor(scope).get(id);
+        if (before == null || update == null) {
+            onEdt(() -> view.showError("Update record", "Refresh and select an existing incident first."));
+            return false;
+        }
+        if (!before.operatorNotes().equals(update.operatorNotes()) && !can(Permission.EDIT_NOTES)) {
+            return begin(Permission.EDIT_NOTES, "INCIDENT_NOTE", "incident:" + id, "Permission check");
+        }
+        if (before.status() != update.status()) {
+            Permission required = update.status() == IncidentStatus.ACKNOWLEDGED ? Permission.ACKNOWLEDGE_INCIDENTS
+                    : Permission.RESOLVE_INCIDENTS;
+            if (!can(required)) return begin(required, "INCIDENT_STATUS", "incident:" + id, "Permission check");
+        }
+        Permission required = before.status() != update.status()
+                ? (update.status() == IncidentStatus.ACKNOWLEDGED ? Permission.ACKNOWLEDGE_INCIDENTS : Permission.RESOLVE_INCIDENTS)
+                : Permission.EDIT_NOTES;
+        return begin(required, "INCIDENT_UPDATE", scope + ":" + id,
+                new JSONObject().put("before", new JSONObject().put("status", before.status()).put("note", before.operatorNotes()))
+                        .put("after", new JSONObject().put("status", update.status()).put("note", update.operatorNotes())).toString());
+    }
+
+    @Override
+    public void copyRecordData(ArchiveScope scope, long id) {
+        if (!begin(Permission.EXPORT_EVIDENCE, "RECORD_COPY", scope + ":" + id, "Copy saved record to clipboard")) return;
+        repositoryFor(scope).findEvidence(id).thenApplyAsync(found -> IncidentReport.text(found.orElseThrow()))
+                .whenComplete((record, failure) -> {
+                    if (failure != null) { showFailure("Copy record", failure); return; }
+                    onEdt(() -> {
+                        try {
+                            security.require(Permission.EXPORT_EVIDENCE);
+                            java.awt.Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new java.awt.datatransfer.StringSelection(record), null);
+                            audit("RECORD_COPY_COMPLETED", scope + ":" + id, "Saved record copied as plain text");
+                            view.showInfo("Record data copied to clipboard.");
+                        } catch (Exception unavailable) { showFailure("Copy record", unavailable); }
+                    });
+                });
+    }
+
+    @Override
+    public void copySnapshot(ArchiveScope scope, long id) {
+        if (!begin(Permission.EXPORT_EVIDENCE, "SNAPSHOT_COPY", scope + ":" + id, "Copy original snapshot to clipboard")) return;
+        repositoryFor(scope).findEvidence(id).thenApplyAsync(found -> {
+            var e = found.orElseThrow();
+            try {
+                java.awt.image.BufferedImage image = e.snapshotBytes() != null && e.snapshotBytes().length > 0
+                        ? javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(e.snapshotBytes()))
+                        : javax.imageio.ImageIO.read(Path.of(e.incident().snapshotPath()).toFile());
+                if (image == null) throw new IllegalStateException("Snapshot is unavailable or invalid.");
+                return image;
+            } catch (java.io.IOException failure) { throw new IllegalStateException("Could not read snapshot", failure); }
+        }).whenComplete((image, failure) -> {
+            if (failure != null) { showFailure("Copy snapshot", failure); return; }
+            onEdt(() -> {
+                try {
+                    security.require(Permission.EXPORT_EVIDENCE);
+                    java.awt.Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new java.awt.datatransfer.Transferable() {
+                        public java.awt.datatransfer.DataFlavor[] getTransferDataFlavors() { return new java.awt.datatransfer.DataFlavor[]{java.awt.datatransfer.DataFlavor.imageFlavor}; }
+                        public boolean isDataFlavorSupported(java.awt.datatransfer.DataFlavor f) { return java.awt.datatransfer.DataFlavor.imageFlavor.equals(f); }
+                        public Object getTransferData(java.awt.datatransfer.DataFlavor f) throws java.awt.datatransfer.UnsupportedFlavorException {
+                            if (!isDataFlavorSupported(f)) throw new java.awt.datatransfer.UnsupportedFlavorException(f); return image;
+                        }
+                    }, null);
+                    audit("SNAPSHOT_COPY_COMPLETED", scope + ":" + id, "Original image copied to clipboard");
+                    view.showInfo("Snapshot copied to clipboard.");
+                } catch (Exception unavailable) { showFailure("Copy snapshot", unavailable); }
+            });
+        });
+    }
+
+    @Override
+    public void exportConfiguration(Path destination, boolean camerasOnly) {
+        if (!begin(Permission.EXPORT_CONFIG, "CONFIG_EXPORT", destination.toString(), "camerasOnly=" + camerasOnly)) return;
+        CompletableFuture.runAsync(() -> ConfigurationFiles.exportFile(settings, destination, camerasOnly))
+                .whenComplete((unused, failure) -> {
+                    if (failure != null) showFailure("Export configuration", failure);
+                    else { audit("CONFIG_EXPORT_COMPLETED", destination.toString(), "camerasOnly=" + camerasOnly); onEdt(() -> view.showInfo("Configuration exported.")); }
+                });
+    }
+
+    @Override
+    public void importConfiguration(Path source, boolean camerasOnly) {
+        if (!begin(camerasOnly ? Permission.CONFIGURE_CAMERAS : Permission.CONFIGURE_ENGINE,
+                "CONFIG_IMPORT", source.toString(), "camerasOnly=" + camerasOnly)) return;
+        CompletableFuture.supplyAsync(() -> ConfigurationFiles.importFile(settings, source, camerasOnly))
+                .whenComplete((loaded, failure) -> { if (failure != null) showFailure("Import configuration", failure); else saveSettings(loaded); });
+    }
+
+    /** Used by authenticated support after its own audit and permission checks. */
+    public CompletableFuture<EngineSettings> applyRemoteSettings(EngineSettings newSettings) {
+        return persistSettings(newSettings);
+    }
+
+    public EngineSettings currentSettings() { return settings; }
+
     public void attachEngineGateway(EngineGateway gateway) {
         this.engineGateway = gateway;
         pushSavedSettingsIfConnected();
@@ -135,6 +264,7 @@ public final class DashboardController implements DashboardActions {
 
     @Override
     public CompletableFuture<String> connectAndroidIpCamera(AndroidIpCameraRequest request) {
+        if (!begin(Permission.CONFIGURE_CAMERAS, "CAMERA_ADB", "camera", "Connect and forward configured phone camera")) return CompletableFuture.failedFuture(new SecurityException("Permission denied"));
         if (request == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("Enter an ADB connection and valid ports first."));
         }
@@ -142,6 +272,7 @@ public final class DashboardController implements DashboardActions {
             if (failure != null) {
                 showFailure("Phone camera ADB", failure);
             } else {
+                audit("CAMERA_CONTROL_COMPLETED", "camera", message);
                 onEdt(() -> view.showInfo(message));
             }
         });
@@ -149,6 +280,7 @@ public final class DashboardController implements DashboardActions {
 
     @Override
     public CompletableFuture<String> applyIpCameraZoom(IpCameraZoomRequest request) {
+        if (!begin(Permission.CONFIGURE_CAMERAS, "CAMERA_ZOOM", "camera", String.valueOf(request))) return CompletableFuture.failedFuture(new SecurityException("Permission denied"));
         if (request == null) {
             return CompletableFuture.failedFuture(new IllegalArgumentException("Enter an HTTP camera source and zoom value first."));
         }
@@ -156,6 +288,7 @@ public final class DashboardController implements DashboardActions {
             if (failure != null) {
                 showFailure("Phone camera zoom", failure);
             } else {
+                audit("CAMERA_CONTROL_COMPLETED", "camera", message);
                 onEdt(() -> view.showInfo(message));
             }
         });
@@ -317,6 +450,7 @@ public final class DashboardController implements DashboardActions {
 
     private void loadIncidentEvidence(
             IncidentRepository repository, ArchiveScope scope, long incidentId, boolean archiveModal) {
+        if (!permitView(Permission.VIEW_INCIDENTS)) return;
         repository.findEvidence(incidentId).whenComplete((evidence, failure) -> {
             if (failure != null) {
                 showFailure("Incident evidence", failure);
@@ -337,13 +471,13 @@ public final class DashboardController implements DashboardActions {
     @Override
     public void acknowledgeIncident(long incidentId) {
         updateOperatorRecord(incidentId, new OperatorIncidentUpdate(
-                IncidentStatus.ACKNOWLEDGED, existingNoteOr(incidentId, "Acknowledged by operator")));
+                IncidentStatus.ACKNOWLEDGED, existingNoteOr(incidentId, "")));
     }
 
     @Override
     public void resolveIncident(long incidentId) {
         updateOperatorRecord(incidentId, new OperatorIncidentUpdate(
-                IncidentStatus.RESOLVED, existingNoteOr(incidentId, "Resolved by operator")));
+                IncidentStatus.RESOLVED, existingNoteOr(incidentId, "")));
     }
 
     @Override
@@ -355,12 +489,14 @@ public final class DashboardController implements DashboardActions {
     public void updateOperatorRecord(ArchiveScope scope, long incidentId, OperatorIncidentUpdate update) {
         ArchiveScope safeScope = scope == null ? ArchiveScope.RECORDED : scope;
         IncidentRepository repository = repositoryFor(safeScope);
+        if (!permitUpdate(safeScope, incidentId, update)) return;
         repository.updateOperatorRecord(incidentId, update).whenComplete((updated, failure) -> {
             if (failure != null) {
                 showFailure("Update operator record", failure);
                 return;
             }
             updated.ifPresentOrElse(incident -> {
+                audit("INCIDENT_UPDATE_COMPLETED", safeScope + ":" + incident.id(), new JSONObject().put("status", incident.status()).put("note", incident.operatorNotes()).toString());
                 cacheFor(safeScope).put(incident.id(), incident);
                 onEdt(() -> {
                     if (safeScope == ArchiveScope.UPLOADED) {
@@ -400,6 +536,7 @@ public final class DashboardController implements DashboardActions {
 
         ArchiveScope safeScope = scope == null ? ArchiveScope.RECORDED : scope;
         IncidentRepository repository = repositoryFor(safeScope);
+        for (var entry : safeUpdates.entrySet()) if (!permitUpdate(safeScope, entry.getKey(), entry.getValue())) return;
         List<CompletableFuture<Optional<Incident>>> writes = new ArrayList<>();
         safeUpdates.forEach((incidentId, update) -> writes.add(repository.updateOperatorRecord(incidentId, update)));
         CompletableFuture.allOf(writes.toArray(CompletableFuture[]::new)).whenComplete((unused, failure) -> {
@@ -416,7 +553,10 @@ public final class DashboardController implements DashboardActions {
                     .map(CompletableFuture::join)
                     .flatMap(Optional::stream)
                     .toList();
-            updated.forEach(incident -> cacheFor(safeScope).put(incident.id(), incident));
+            updated.forEach(incident -> {
+                audit("INCIDENT_UPDATE_COMPLETED", safeScope + ":" + incident.id(), new JSONObject().put("status", incident.status()).put("note", incident.operatorNotes()).toString());
+                cacheFor(safeScope).put(incident.id(), incident);
+            });
             onEdt(() -> {
                 updated.forEach(incident -> {
                     if (safeScope == ArchiveScope.UPLOADED) {
@@ -463,6 +603,7 @@ public final class DashboardController implements DashboardActions {
         ArchiveScope safeScope = scope == null ? ArchiveScope.RECORDED : scope;
         MediaDeletionOptions safeOptions = options == null ? MediaDeletionOptions.recordsOnly() : options;
         IncidentRepository repository = repositoryFor(safeScope);
+        if (!begin(Permission.DELETE_RECORDS, "INCIDENT_DELETE", safeScope.toString(), "ids=" + ids + "; sourceMedia=" + safeOptions)) return;
         MediaService scopedMediaService = mediaServiceFor(safeScope);
         List<CompletableFuture<Optional<com.senyalert.model.IncidentEvidence>>> evidenceLoads = ids.stream()
                 .map(repository::findEvidence)
@@ -513,6 +654,7 @@ public final class DashboardController implements DashboardActions {
                 onEdt(() -> view.showInfo("Those incident records are no longer available."));
                 return;
             }
+            audit("INCIDENT_DELETE_COMPLETED", safeScope.toString(), "deletedIds=" + outcome.deletedIds() + "; mediaFailures=" + outcome.mediaFailures());
             outcome.deletedIds().forEach(cacheFor(safeScope)::remove);
             onEdt(() -> {
                 if (safeScope == ArchiveScope.UPLOADED) {
@@ -540,11 +682,13 @@ public final class DashboardController implements DashboardActions {
     @Override
     public CompletableFuture<Boolean> resetNextIncidentId(ArchiveScope scope) {
         ArchiveScope safeScope = scope == null ? ArchiveScope.RECORDED : scope;
+        if (!begin(Permission.DELETE_RECORDS, "ARCHIVE_RESET_ID", safeScope.toString(), "Reset only if archive is empty")) return CompletableFuture.failedFuture(new SecurityException("Permission denied"));
         return repositoryFor(safeScope).resetNextIncidentIdIfEmpty().whenComplete((reset, failure) -> {
             if (failure != null) {
                 showFailure("Reset next incident ID", failure);
                 return;
             }
+            audit("ARCHIVE_RESET_ID_COMPLETED", safeScope.toString(), "reset=" + reset);
             if (!Boolean.TRUE.equals(reset)) {
                 onEdt(() -> view.showInfo("Cannot reset the next "
                         + safeScope.displayName().toLowerCase()
@@ -564,32 +708,44 @@ public final class DashboardController implements DashboardActions {
 
     @Override
     public void saveSettings(EngineSettings newSettings) {
-        settingsStore.save(newSettings).whenComplete((saved, failure) -> {
-            if (failure != null) {
-                showFailure("Save settings", failure);
-                return;
-            }
+        if (newSettings == null) return;
+        JSONObject before = settings.toPersistedJson(), after = newSettings.toPersistedJson();
+        if (!settings.cameras().equals(newSettings.cameras()) && !begin(Permission.CONFIGURE_CAMERAS,
+                "CAMERA_SETTINGS_UPDATE", "configuration", ConfigurationFiles.diff(before, after))) return;
+        if (!ConfigurationFiles.engineOnly(before).similar(ConfigurationFiles.engineOnly(after)) && !begin(Permission.CONFIGURE_ENGINE,
+                "ENGINE_SETTINGS_UPDATE", "configuration", ConfigurationFiles.diff(before, after))) return;
+        if (before.similar(after)) { onEdt(() -> view.showInfo("Settings already match the saved configuration.")); return; }
+        persistSettings(newSettings).whenComplete((saved, failure) -> {
+            if (failure != null) showFailure("Save settings", failure);
+            else audit("SETTINGS_UPDATE_COMPLETED", "configuration", ConfigurationFiles.diff(before, saved.toPersistedJson()));
+        });
+    }
+
+    private CompletableFuture<EngineSettings> persistSettings(EngineSettings newSettings) {
+        return settingsStore.save(newSettings).thenApply(saved -> {
             settings = saved;
             settingsLoaded = true;
             EngineGateway gateway = engineGateway;
             boolean delivered = gateway != null && gateway.sendSettings(saved);
             onEdt(() -> {
                 view.showSettings(saved);
-                view.showInfo(delivered
-                        ? "Settings saved and sent to the vision engine."
+                view.showInfo(delivered ? "Settings saved and sent to the vision engine."
                         : "Settings saved locally. Connect the vision engine to apply them live.");
             });
+            return saved;
         });
     }
 
     @Override
     public void toggleEnginePause() {
+        if (!begin(Permission.CONFIGURE_ENGINE, "ENGINE_PAUSE", "engine", "requestedPaused=" + !enginePaused)) return;
         EngineGateway gateway = engineGateway;
         boolean requestedState = !enginePaused;
         if (gateway == null || !gateway.setPaused(requestedState)) {
             onEdt(() -> view.showInfo("The vision engine is not connected."));
             return;
         }
+        audit("ENGINE_PAUSE_COMMAND_SENT", "engine", "paused=" + requestedState);
         enginePaused = requestedState;
         onEdt(() -> view.showEngineStatus(new EngineStatus(true, requestedState,
                 requestedState ? "Pause command sent to engine" : "Resume command sent to engine", "")));
@@ -597,12 +753,14 @@ public final class DashboardController implements DashboardActions {
 
     @Override
     public void restartEngine() {
+        if (!begin(Permission.CONFIGURE_ENGINE, "ENGINE_RESTART", "engine", "Reconnect camera workers")) return;
         EngineGateway gateway = engineGateway;
         if (gateway == null || !gateway.restartEngine()) {
             onEdt(() -> view.showError("Restart engine",
                     "The vision engine is not connected. Start it, then try Restart Engine again."));
             return;
         }
+        audit("ENGINE_RESTART_COMMAND_SENT", "engine", "Reconnect camera workers");
         onEdt(() -> {
             view.showEngineStatus(new EngineStatus(true, enginePaused,
                     "Restart command sent. Enabled camera workers are reconnecting; settings and evidence are retained.", ""));
@@ -617,6 +775,7 @@ public final class DashboardController implements DashboardActions {
 
     @Override
     public void playVideoNatively(ArchiveScope scope, long incidentId) {
+        if (!permitView(Permission.VIEW_INCIDENTS)) return;
         mediaServiceFor(scope).openNatively(incidentId).whenComplete((unused, failure) -> {
             if (failure != null) {
                 showFailure("Native playback", failure);
@@ -631,11 +790,13 @@ public final class DashboardController implements DashboardActions {
 
     @Override
     public void exportVideo(ArchiveScope scope, long incidentId, Path destination) {
+        if (!begin(Permission.EXPORT_EVIDENCE, "VIDEO_EXPORT", scope + ":" + incidentId, destination.toString())) return;
         mediaServiceFor(scope).exportVideo(incidentId, destination).whenComplete((unused, failure) -> {
             if (failure != null) {
                 showFailure("Export video", failure);
                 return;
             }
+            audit("VIDEO_EXPORT_COMPLETED", scope + ":" + incidentId, destination.toString());
             onEdt(() -> view.showInfo("Video exported to " + destination.getFileName()));
         });
     }
@@ -651,53 +812,20 @@ public final class DashboardController implements DashboardActions {
         if (incidentIds == null || incidentIds.isEmpty() || destinationDirectory == null || mode == null) {
             return;
         }
+        if (!begin(Permission.EXPORT_EVIDENCE, "EVIDENCE_EXPORT", String.valueOf(scope), "ids=" + incidentIds + "; destination=" + destinationDirectory + "; mode=" + mode)) return;
         mediaServiceFor(scope).exportArchive(incidentIds, destinationDirectory, mode).whenComplete((summary, failure) -> {
             if (failure != null) {
                 showFailure("Export evidence archive", failure);
                 return;
             }
+            audit("EVIDENCE_EXPORT_COMPLETED", String.valueOf(scope), formatArchiveExportSummary(summary));
             onEdt(() -> view.showInfo(formatArchiveExportSummary(summary)));
         });
     }
 
     @Override
     public void submitUploadedVideo(UploadedVideoRequest request) {
-        if (request == null) {
-            return;
-        }
-        if (!Files.isRegularFile(request.source())) {
-            String message = "The selected file is no longer available. Choose a readable local video file.";
-            onEdt(() -> {
-                view.showUploadedVideoStatus(new UploadedVideoStatus("", "", "", "FAILED", message, 0, 0, 0));
-                view.showError("Video upload", message);
-            });
-            return;
-        }
-        EngineGateway gateway = engineGateway;
-        if (gateway == null || !gateway.isConnected()) {
-            String message = "The vision engine is offline. Start the Python ingestion engine, then upload the video again.";
-            onEdt(() -> {
-                view.showUploadedVideoStatus(new UploadedVideoStatus("", "", request.source().getFileName().toString(),
-                        "FAILED", message, 0, 0, 0));
-                view.showError("Video upload", message);
-            });
-            return;
-        }
-        if (!gateway.submitUploadedVideo(request)) {
-            String message = "The upload command could not be sent. Confirm that the local engine is still connected.";
-            onEdt(() -> {
-                view.showUploadedVideoStatus(new UploadedVideoStatus("", "", request.source().getFileName().toString(),
-                        "FAILED", message, 0, 0, 0));
-                view.showError("Video upload", message);
-            });
-            return;
-        }
-        onEdt(() -> {
-            view.showUploadedVideoStatus(new UploadedVideoStatus("", "", request.source().getFileName().toString(),
-                    "SUBMITTED", "Waiting for the local engine to accept the analysis job.", 0, 0, 0));
-            view.showInfo("Sent " + request.source().getFileName()
-                    + " for offline analysis. The Video analysis tab will show progress and outcome.");
-        });
+        onEdt(() -> view.showInfo("Video analysis has been retired. Use Benchmarking for evaluation runs."));
     }
 
     private static String formatArchiveExportSummary(ArchiveExportSummary summary) {
@@ -763,6 +891,7 @@ public final class DashboardController implements DashboardActions {
             cause = cause.getCause();
         }
         String message = cause.getMessage() == null ? cause.getClass().getSimpleName() : cause.getMessage();
+        try { audit("ACTION_FAILED", action, message); } catch (RuntimeException ignored) { /* Report the original error. */ }
         onEdt(() -> view.showError(action, message));
     }
 

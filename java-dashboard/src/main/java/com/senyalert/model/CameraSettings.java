@@ -191,6 +191,7 @@ public record CameraSettings(
 
     static String validateSource(String value) {
         String source = nonBlank(value, "0");
+        if (source.matches("env:[A-Z][A-Z0-9_]{1,127}")) return source;
         if (source.matches("\\d+")) {
             try {
                 if (Integer.parseInt(source) >= 0) {
@@ -228,7 +229,7 @@ public record CameraSettings(
             // Use the shared validation message below.
         }
         throw new IllegalArgumentException(
-                "Camera source must be a non-negative webcam index, uvc://<webcam-index>, an http(s)/rtsp(s) stream URL, or adb://<serial>.");
+                "Camera source must be env:VARIABLE_NAME, a non-negative webcam index, uvc://<webcam-index>, an http(s)/rtsp(s) stream URL, or adb://<serial>.");
     }
 
     private static String nonBlank(String value, String fallback) {

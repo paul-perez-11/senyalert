@@ -1,5 +1,16 @@
 # SenyAlert benchmark and evaluation guide
 
+## Run from the desktop app
+
+The **Benchmarking** tab exposes all six tools below with guided settings,
+test-condition notes, progress/log output, cancellation, and an **Open latest
+results** button. Sign in with benchmarking permission. Follow
+[the simple guide](benchmarking-simple-guide.md) for a nontechnical walkthrough.
+Every GUI trial has a new folder containing `trial.json` and `run.log`; the
+existing runners put their raw outputs inside it. Cancelled/failed GUI trials
+are excluded from the result index. Set `SENYALERT_PYTHON` to a Python executable
+and, for a relocated app, `SENYALERT_PROJECT_ROOT` to the project root if needed.
+
 `tools/benchmark_senyalert.py` creates a new timestamped folder for every
 run under `benchmark-results/`. Its CSV files hold raw observations; its JSON
 file records p50/median, p95, p99, mean, minimum, and maximum values together

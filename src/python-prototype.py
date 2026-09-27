@@ -46,6 +46,54 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 # scripts as well as the normal ``python src/python-prototype.py`` launch.
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+
+
+def _load_senyalert_environment() -> None:
+    """Load the documented env file for a standalone engine launch.
+
+    The managed Java child already receives the merged non-secret environment,
+    so it marks itself as loaded and never rereads credentials from disk.
+    """
+    if os.environ.get("SENYALERT_ENV_LOADED") == "1":
+        return
+    selected = os.environ.get("SENYALERT_ENV_FILE", "").strip()
+    env_file = Path(selected).expanduser() if selected else PROJECT_ROOT / "senyalert.env"
+    if selected and not env_file.is_absolute():
+        env_file = (Path.cwd() / env_file).resolve()
+    if not selected:
+        env_file = env_file.resolve()
+    if not env_file.is_file():
+        if selected:
+            raise RuntimeError("SENYALERT_ENV_FILE must name a readable file.")
+        return
+    try:
+        lines = env_file.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise RuntimeError(f"Could not read {env_file.name}.") from error
+    key_pattern = re.compile(r"[A-Za-z_][A-Za-z0-9_]*$")
+    private_keys = {
+        "SENYALERT_SUPERADMIN_PASSWORD_HASH",
+        "SENYALERT_SUPPORT_SECRET",
+        "SENYALERT_CLIENT_ID",
+    }
+    for line_number, raw in enumerate(lines, start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            raise RuntimeError(f"Invalid {env_file.name} entry at line {line_number}. Use NAME=value.")
+        key, value = (part.strip() for part in line.split("=", 1))
+        if not key_pattern.fullmatch(key):
+            raise RuntimeError(f"Invalid {env_file.name} variable name at line {line_number}.")
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        elif value.startswith(("'", '"')):
+            raise RuntimeError(f"Unclosed quoted value in {env_file.name} at line {line_number}.")
+        if key not in private_keys:
+            os.environ.setdefault(key, value)
+
+
+_load_senyalert_environment()
 # Keep new media out of the project root.  Existing root-level files are left
 # untouched because a dashboard/archive may still refer to their old paths.
 EVIDENCE_ROOT_DIR = PROJECT_ROOT / "evidence"

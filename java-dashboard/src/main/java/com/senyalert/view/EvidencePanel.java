@@ -6,6 +6,7 @@ import com.senyalert.model.IncidentStatus;
 import com.senyalert.model.MediaDeletionOptions;
 import com.senyalert.model.OperatorIncidentUpdate;
 import com.senyalert.view.ui.BlueTheme;
+import com.senyalert.view.ui.NativeFileDialogs;
 import com.senyalert.view.ui.RoundedPanel;
 import com.senyalert.view.ui.StyledButton;
 import java.awt.BorderLayout;
@@ -23,7 +24,6 @@ import javax.imageio.ImageIO;
 import javax.swing.BorderFactory;
 import javax.swing.ImageIcon;
 import javax.swing.JButton;
-import javax.swing.JFileChooser;
 import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
@@ -44,7 +44,16 @@ final class EvidencePanel extends RoundedPanel {
     private final JButton play = new StyledButton("Play Native", FontAwesomeSolid.PLAY, BlueTheme.DEEP_BLUE);
     private final JButton export = new StyledButton("Export Video", FontAwesomeSolid.FILE_EXPORT, BlueTheme.DEEP_BLUE);
     private final JButton deleteRecord = new StyledButton("Delete record", FontAwesomeSolid.EXCLAMATION_TRIANGLE, BlueTheme.DANGER);
+    private final JPanel actionBar = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 4, 0));
+    private final JPanel dispatchActionsHost = new JPanel(new BorderLayout());
+    private final JPanel bottomControls = new JPanel(new BorderLayout(0, 6));
+    private final JPanel workflowButtons = new JPanel(new java.awt.GridLayout(1, 3, 4, 0));
+    private final JPanel evidenceButtons = new JPanel(new java.awt.GridLayout(1, 3, 4, 0));
+    private java.util.function.Predicate<com.senyalert.security.Permission> allowed = ignored -> false;
+    void setPermissions(java.util.function.Predicate<com.senyalert.security.Permission> allowed) { this.allowed = allowed; }
     private IncidentEvidence currentEvidence;
+    private JPanel operatorEditor;
+    private boolean dispatchWorkflowControlsVisible = true;
 
     private BiConsumer<Long, OperatorIncidentUpdate> operatorUpdateAction = (ignored, update) -> { };
     private BiConsumer<Long, MediaDeletionOptions> deleteAction = (ignored, options) -> { };
@@ -53,7 +62,7 @@ final class EvidencePanel extends RoundedPanel {
 
     EvidencePanel() {
         super(18);
-        setLayout(new BorderLayout(12, 12));
+        setLayout(new BorderLayout(8, 8));
         setBackground(BlueTheme.CARD);
         setBorder(BlueTheme.cardBorder());
 
@@ -69,7 +78,7 @@ final class EvidencePanel extends RoundedPanel {
         preview.setOpaque(true);
         preview.setBackground(new Color(229, 239, 249));
         preview.setBorder(BorderFactory.createLineBorder(BlueTheme.BORDER));
-        preview.setPreferredSize(new Dimension(390, 225));
+        preview.setPreferredSize(new Dimension(280, 158));
 
         metadata.setEditable(false);
         metadata.setFocusable(false);
@@ -87,26 +96,43 @@ final class EvidencePanel extends RoundedPanel {
         operatorNotes.setBackground(Color.WHITE);
         operatorNotes.setBorder(BorderFactory.createEmptyBorder(5, 6, 5, 6));
 
-        JPanel content = new JPanel(new BorderLayout(0, 10));
+        // This panel sits beside the live queue.  Keep its saved snapshot and
+        // evidence facts in one vertical column so the queue retains width.
+        JPanel content = new JPanel(new BorderLayout(0, 8));
         content.setOpaque(false);
         content.add(preview, BorderLayout.NORTH);
+        JPanel workflow = new JPanel(new BorderLayout(0, 6)); workflow.setOpaque(false);
         JScrollPane detailsScroll = new JScrollPane(metadata);
         detailsScroll.setBorder(BorderFactory.createEmptyBorder());
         detailsScroll.setOpaque(false);
         detailsScroll.getViewport().setOpaque(false);
-        content.add(detailsScroll, BorderLayout.CENTER);
-        content.add(buildOperatorEditor(), BorderLayout.SOUTH);
+        detailsScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        detailsScroll.getVerticalScrollBar().setUnitIncrement(16);
+        workflow.add(detailsScroll, BorderLayout.CENTER);
+        operatorEditor = buildOperatorEditor();
+        workflow.add(operatorEditor, BorderLayout.SOUTH);
+        content.add(workflow, BorderLayout.CENTER);
         add(content, BorderLayout.CENTER);
 
-        JPanel buttons = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 8, 0));
-        buttons.setOpaque(false);
-        buttons.add(acknowledge);
-        buttons.add(resolve);
-        buttons.add(saveOperatorRecord);
-        buttons.add(play);
-        buttons.add(export);
-        buttons.add(deleteRecord);
-        add(buttons, BorderLayout.SOUTH);
+        actionBar.setOpaque(false);
+        dispatchActionsHost.setOpaque(false);
+        bottomControls.setOpaque(false);
+        workflowButtons.setOpaque(false);
+        workflowButtons.add(acknowledge);
+        workflowButtons.add(resolve);
+        workflowButtons.add(saveOperatorRecord);
+        evidenceButtons.setOpaque(false);
+        evidenceButtons.add(play);
+        evidenceButtons.add(export);
+        evidenceButtons.add(deleteRecord);
+        evidenceButtons.setPreferredSize(new Dimension(294, 29));
+        compactEvidenceButton(play);
+        compactEvidenceButton(export);
+        compactEvidenceButton(deleteRecord);
+        rebuildActionBar();
+        bottomControls.add(dispatchActionsHost, BorderLayout.NORTH);
+        bottomControls.add(actionBar, BorderLayout.SOUTH);
+        add(bottomControls, BorderLayout.SOUTH);
 
         acknowledge.addActionListener(event -> saveOperatorUpdate(IncidentStatus.ACKNOWLEDGED));
         resolve.addActionListener(event -> saveOperatorUpdate(IncidentStatus.RESOLVED));
@@ -114,7 +140,32 @@ final class EvidencePanel extends RoundedPanel {
         play.addActionListener(event -> withCurrent(playAction));
         export.addActionListener(event -> chooseExport());
         deleteRecord.addActionListener(event -> confirmDelete());
+        export.setToolTipText("Exports the video and an adjacent folder containing JSON and plaintext record data. This action is audited.");
         showEmptyState();
+    }
+
+    /**
+     * Live Dispatch keeps acknowledgement, resolution, and notes directly beside
+     * its queue. Evidence Archive continues to expose its own operator dialog.
+     */
+    void setDispatchWorkflowControlsVisible(boolean visible) {
+        dispatchWorkflowControlsVisible = visible;
+        if (operatorEditor != null) {
+            operatorEditor.setVisible(visible);
+        }
+        rebuildActionBar();
+        revalidate();
+        repaint();
+    }
+
+    /** Places the live acknowledgement, resolution, and note controls beside saved evidence. */
+    void setLiveDispatchActions(DispatchActionPanel dispatchActions) {
+        dispatchActionsHost.removeAll();
+        if (dispatchActions != null) {
+            dispatchActionsHost.add(dispatchActions, BorderLayout.CENTER);
+        }
+        dispatchActionsHost.revalidate();
+        dispatchActionsHost.repaint();
     }
 
     void setActions(
@@ -175,6 +226,19 @@ final class EvidencePanel extends RoundedPanel {
         deleteRecord.setEnabled(false);
     }
 
+    private void rebuildActionBar() {
+        actionBar.removeAll();
+        if (dispatchWorkflowControlsVisible) {
+            actionBar.add(workflowButtons);
+        }
+        actionBar.add(evidenceButtons);
+    }
+
+    private static void compactEvidenceButton(JButton button) {
+        button.setFont(BlueTheme.font(Font.BOLD, 10));
+        button.setPreferredSize(new Dimension(94, 28));
+    }
+
     private JPanel buildOperatorEditor() {
         JPanel editor = new JPanel(new BorderLayout(0, 5));
         editor.setOpaque(false);
@@ -208,14 +272,14 @@ final class EvidencePanel extends RoundedPanel {
         operatorStatus.setText("Status: " + incident.status().name());
         operatorNotes.setText(incident.operatorNotes());
         operatorNotes.setCaretPosition(0);
-        operatorNotes.setEditable(true);
+        operatorNotes.setEditable(allowed.test(com.senyalert.security.Permission.EDIT_NOTES));
         boolean completed = incident.status() == IncidentStatus.RESOLVED;
-        acknowledge.setEnabled(incident.status() == IncidentStatus.PENDING);
-        resolve.setEnabled(!completed);
-        saveOperatorRecord.setEnabled(true);
+        acknowledge.setEnabled(incident.status() == IncidentStatus.PENDING && allowed.test(com.senyalert.security.Permission.ACKNOWLEDGE_INCIDENTS));
+        resolve.setEnabled(!completed && allowed.test(com.senyalert.security.Permission.RESOLVE_INCIDENTS));
+        saveOperatorRecord.setEnabled(allowed.test(com.senyalert.security.Permission.EDIT_NOTES));
         play.setEnabled(incident.mediaReady());
-        export.setEnabled(incident.mediaReady());
-        deleteRecord.setEnabled(true);
+        export.setEnabled(incident.mediaReady() && allowed.test(com.senyalert.security.Permission.EXPORT_EVIDENCE));
+        deleteRecord.setEnabled(allowed.test(com.senyalert.security.Permission.DELETE_RECORDS));
     }
 
     private IncidentStatus currentStatus() {
@@ -264,7 +328,7 @@ final class EvidencePanel extends RoundedPanel {
                 // The remaining details are still available even if one image is malformed.
             }
         }
-        preview.setIcon(new ImageIcon(scale(image == null ? placeholderImage("Snapshot not delivered") : image, 390, 225)));
+        preview.setIcon(new ImageIcon(scale(image == null ? placeholderImage("Snapshot not delivered") : image, 280, 160)));
     }
 
     private static String formatMetadata(Incident incident, IncidentEvidence evidence) {
@@ -298,11 +362,12 @@ final class EvidencePanel extends RoundedPanel {
         if (currentEvidence == null) {
             return;
         }
-        JFileChooser chooser = new JFileChooser();
-        chooser.setSelectedFile(new java.io.File("SenyAlert-incident-" + currentEvidence.incident().id() + ".mp4"));
-        if (chooser.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
-            exportAction.accept(currentEvidence.incident().id(), chooser.getSelectedFile().toPath());
-        }
+        NativeFileDialogs.saveFile(this,
+                "Save video; a JSON and plaintext record-data folder is also created",
+                com.senyalert.service.ExportDefaults.Kind.EVIDENCE,
+                "SenyAlert-incident-" + currentEvidence.incident().id() + ".mp4",
+                java.util.List.of("mp4", "avi", "mkv", "mov", "wmv", "webm"))
+                .ifPresent(destination -> exportAction.accept(currentEvidence.incident().id(), destination));
     }
 
     private void withCurrent(LongConsumer action) {

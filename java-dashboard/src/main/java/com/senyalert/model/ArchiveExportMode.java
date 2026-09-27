@@ -6,12 +6,12 @@ package com.senyalert.model;
  * evidence paths.
  */
 public enum ArchiveExportMode {
-    /** Human-readable incident report plus every available image and video artifact. */
+    /** JSON and plaintext record data plus every available image and video artifact. */
     RECORD_BUNDLE,
-    /** Snapshot/image artifacts only. */
+    /** Snapshot/image artifacts with JSON and plaintext record data. */
     SNAPSHOTS,
-    /** Video artifacts only. */
+    /** Video artifacts with JSON and plaintext record data. */
     VIDEOS,
-    /** Snapshot and video artifacts without the record report. */
+    /** Snapshot and video artifacts, each accompanied by JSON and plaintext record data. */
     MEDIA
 }
