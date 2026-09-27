@@ -27,7 +27,7 @@ public final class ExportSettingsSmoke {
             check(defaults.evidenceDirectory().startsWith(root.toAbsolutePath().normalize()),
                     "defaults stay beside the isolated installation");
 
-            EngineSettings engine = EngineSettings.defaults();
+            EngineSettings engine = EngineSettings.defaults().withStartEngineOnStartup(false);
             store.save(engine).join();
             ExportSettings requested = new ExportSettings(
                     root.resolve("operator-exports").resolve("evidence"),
@@ -43,6 +43,8 @@ public final class ExportSettingsSmoke {
             JSONObject persisted = new JSONObject(Files.readString(config, StandardCharsets.UTF_8));
             check(persisted.has("exportDefaults"), "engine save retains export defaults");
             check(EngineSettings.fromJson(persisted).equals(engine), "export settings do not alter engine configuration");
+            check(!persisted.getBoolean("start_engine_on_startup"), "engine startup preference persists locally");
+            check(!engine.toEngineJson().has("start_engine_on_startup"), "engine startup preference is not sent to Python");
         }
         System.out.println("Export settings smoke passed. Isolated artifacts retained at " + root.toAbsolutePath());
     }

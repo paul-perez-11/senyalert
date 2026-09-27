@@ -5,6 +5,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import org.json.JSONObject;
@@ -37,9 +38,14 @@ public final class RemoteSupportSmoke {
         String supportKey = "remote-smoke-support-key-0123456789abcdef";
         RemoteSupportService service = new RemoteSupportService(backend, supportKey, "not-used", ignored -> { });
         try {
-            URI local = service.startLocal(Duration.ofMinutes(1));
+            expectFailure(() -> service.start(Duration.ZERO), "zero-minute session is rejected");
+            expectFailure(() -> service.start(Duration.ofMinutes(121)), "overlong session is rejected");
+            Instant expectedExpiryFloor = Instant.now().plus(Duration.ofMinutes(2));
+            URI local = service.startLocal(Duration.ofMinutes(2));
             String link = local + "/#" + service.localTestToken();
             HttpClient http = HttpClient.newHttpClient();
+
+            check(service.expiresAt().isAfter(expectedExpiryFloor.minusSeconds(2)), "requested session duration is retained");
 
             HttpResponse<String> unauthorized = http.send(HttpRequest.newBuilder(local.resolve("/api/snapshot"))
                     .GET().build(), HttpResponse.BodyHandlers.ofString());

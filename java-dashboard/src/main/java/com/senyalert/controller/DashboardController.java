@@ -64,6 +64,8 @@ public final class DashboardController implements DashboardActions {
     private volatile EngineGateway engineGateway;
     private volatile boolean enginePaused;
     private volatile boolean settingsLoaded;
+    private volatile java.util.function.Supplier<CompletableFuture<Void>> engineStarter =
+            () -> CompletableFuture.failedFuture(new IllegalStateException("The dashboard-owned engine launcher is unavailable."));
 
     public DashboardController(
             DashboardView view,
@@ -262,6 +264,13 @@ public final class DashboardController implements DashboardActions {
         pushSavedSettingsIfConnected();
     }
 
+    /** Installed by the application runtime because it owns the child process lifecycle. */
+    public void attachEngineStarter(java.util.function.Supplier<CompletableFuture<Void>> starter) {
+        this.engineStarter = starter == null
+                ? () -> CompletableFuture.failedFuture(new IllegalStateException("The dashboard-owned engine launcher is unavailable."))
+                : starter;
+    }
+
     @Override
     public CompletableFuture<String> connectAndroidIpCamera(AndroidIpCameraRequest request) {
         if (!begin(Permission.CONFIGURE_CAMERAS, "CAMERA_ADB", "camera", "Connect and forward configured phone camera")) return CompletableFuture.failedFuture(new SecurityException("Permission denied"));
@@ -294,8 +303,9 @@ public final class DashboardController implements DashboardActions {
         });
     }
 
-    public void initialize() {
-        settingsStore.load().whenComplete((loaded, failure) -> {
+    public CompletableFuture<EngineSettings> initialize() {
+        CompletableFuture<EngineSettings> loadedSettings = settingsStore.load();
+        loadedSettings.whenComplete((loaded, failure) -> {
             if (failure != null) {
                 showFailure("Settings", failure);
                 return;
@@ -306,6 +316,7 @@ public final class DashboardController implements DashboardActions {
             pushSavedSettingsIfConnected();
         });
         refreshIncidents();
+        return loadedSettings;
     }
 
     public void onDistress(DistressEvent event) {
@@ -749,6 +760,48 @@ public final class DashboardController implements DashboardActions {
         enginePaused = requestedState;
         onEdt(() -> view.showEngineStatus(new EngineStatus(true, requestedState,
                 requestedState ? "Pause command sent to engine" : "Resume command sent to engine", "")));
+    }
+
+    @Override
+    public void startEngine() {
+        if (!begin(Permission.CONFIGURE_ENGINE, "ENGINE_START", "ingestion-engine", "Manual start requested")) return;
+        java.util.function.Supplier<CompletableFuture<Void>> starter = engineStarter;
+        CompletableFuture<Void> launched;
+        try {
+            launched = starter.get();
+        } catch (RuntimeException failure) {
+            showFailure("Start engine", failure);
+            return;
+        }
+        launched.whenComplete((unused, failure) -> {
+            if (failure != null) {
+                showFailure("Start engine", failure);
+                return;
+            }
+            audit("ENGINE_PROCESS_START_REQUESTED", "ingestion-engine", "Manual start request completed.");
+            onEdt(() -> view.showInfo("Vision engine start requested."));
+        });
+    }
+
+    @Override
+    public void setStartEngineOnStartup(boolean enabled) {
+        EngineSettings current = settings;
+        if (current.startEngineOnStartup() == enabled) return;
+        if (!begin(Permission.CONFIGURE_ENGINE, "ENGINE_AUTOSTART_UPDATE", "ingestion-engine",
+                "startEngineOnStartup=" + enabled)) {
+            onEdt(() -> view.showSettings(current));
+            return;
+        }
+        EngineSettings updated = current.withStartEngineOnStartup(enabled);
+        persistSettings(updated).whenComplete((saved, failure) -> {
+            if (failure != null) {
+                onEdt(() -> view.showSettings(current));
+                showFailure("Start engine on startup", failure);
+                return;
+            }
+            audit("ENGINE_AUTOSTART_UPDATE_COMPLETED", "ingestion-engine",
+                    "startEngineOnStartup=" + saved.startEngineOnStartup());
+        });
     }
 
     @Override

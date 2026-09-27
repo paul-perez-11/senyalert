@@ -119,7 +119,8 @@ public class DashboardFrame extends JFrame implements DashboardView {
     @Override
     public void setActions(DashboardActions actions) {
         this.actions = actions;
-        settingsPanel.setActions(actions::saveSettings, actions::toggleEnginePause, actions::restartEngine);
+        settingsPanel.setActions(actions::saveSettings, actions::setStartEngineOnStartup,
+                actions::startEngine, actions::toggleEnginePause, actions::restartEngine);
         cameraManagementPanel.setSaveAction(actions::saveSettings);
         cameraManagementPanel.setPhoneCameraActions(
                 actions::connectAndroidIpCamera,

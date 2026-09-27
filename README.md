@@ -99,13 +99,19 @@ python senyalert.py run
 
 The launcher opens the Java sign-in screen first. After a normal user or
 administrator successfully signs in and the dashboard is visible, SenyAlert
-starts the Python ingestion engine it owns. Closing or signing out stops that
-owned process and its descendants, then closes the dashboard's local server.
+starts the Python ingestion engine it owns only when **Start engine on startup**
+is enabled in Settings > Engine settings. When disabled, an authorised operator
+can use **Start Engine** there. Closing or signing out stops that owned process
+and its descendants, then closes the dashboard's local server.
+Choosing **Exit** from the sign-in screen also terminates the launch process
+and returns the terminal to its caller.
 The dashboard listens on `ws://localhost:8080`; the engine reconnects until it
 is available. Do not use Maven's `clean` phase for normal demo starts.
 
-Set `SENYALERT_ENGINE_AUTOSTART=false` only when you deliberately run a
-separate local engine. SenyAlert does not stop a separately started process.
+For a new or legacy configuration, `SENYALERT_ENGINE_AUTOSTART=false` makes
+**Start engine on startup** initially unchecked. Once saved in the dashboard,
+the checkbox is the authoritative setting. SenyAlert does not stop a separately
+started engine.
 
 If you prefer to start the dashboard separately:
 

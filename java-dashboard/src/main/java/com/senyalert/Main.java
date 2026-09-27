@@ -135,6 +135,7 @@ public final class Main {
             Optional<com.senyalert.security.Session> signedIn = LoginDialog.login(null, security);
             if (signedIn.isEmpty()) {
                 close();
+                System.exit(0);
                 return;
             }
             SecurityContext context = new SecurityContext(security, signedIn.get());
@@ -162,10 +163,8 @@ public final class Main {
             EngineWebSocketServer server = new EngineWebSocketServer(8080, controller);
             controller.attachEngineGateway(server);
             dashboard.setActions(controller);
-            ManagedEngineProcess engine = EnvironmentConfiguration.booleanValue("SENYALERT_ENGINE_AUTOSTART", true)
-                    ? ManagedEngineProcess.forCurrentInstallation(message ->
-                            controller.onEngineStatus(EngineStatus.disconnected(message)))
-                    : null;
+            ManagedEngineProcess engine = ManagedEngineProcess.forCurrentInstallation(message ->
+                    controller.onEngineStatus(EngineStatus.disconnected(message)));
 
             BenchmarkPanel benchmark = null;
             RemoteSupportPanel remote = null;
@@ -194,6 +193,7 @@ public final class Main {
 
             ActiveSession session = new ActiveSession(context, server, engine, benchmark, remote, dashboard);
             active = session;
+            controller.attachEngineStarter(() -> startEngineAfterDashboardVisible(session, controller));
             dashboard.addSettingsWorkspace("Account", new AccountSettingsPanel(context, () -> finishSession(session)),
                     "Change only your username or password. Saving signs out so you can use the new credentials.");
             dashboard.applyPermissions(context);
@@ -202,22 +202,25 @@ public final class Main {
             });
             dashboard.setVisible(true);
             server.start();
-            controller.initialize();
-            if (engine == null) {
-                controller.onEngineStatus(EngineStatus.disconnected(
-                        "Automatic engine launch is disabled. Start an external local engine when needed."));
-            } else {
-                // Defer until the visible dashboard has had a complete Swing turn.
-                // This keeps the sign-in and dashboard visibly first, before OpenCV opens.
-                SwingUtilities.invokeLater(() -> startEngineAfterDashboardVisible(session, controller));
-            }
+            controller.initialize().whenComplete((loaded, failure) -> {
+                if (failure != null) {
+                    controller.onEngineStatus(EngineStatus.disconnected("Engine settings could not be loaded; the engine was not started."));
+                } else if (loaded.startEngineOnStartup()) {
+                    // Defer until the visible dashboard has had a complete Swing turn.
+                    // This keeps the sign-in and dashboard visibly first, before OpenCV opens.
+                    SwingUtilities.invokeLater(() -> startEngineAfterDashboardVisible(session, controller));
+                } else {
+                    controller.onEngineStatus(EngineStatus.disconnected(
+                            "Engine startup is disabled. Use Start Engine in Settings > Engine settings when needed."));
+                }
+            });
         }
 
-        private void startEngineAfterDashboardVisible(ActiveSession session, DashboardController controller) {
+        private CompletableFuture<Void> startEngineAfterDashboardVisible(ActiveSession session, DashboardController controller) {
             if (closed || active != session || !session.window().isDisplayable() || session.engine() == null) {
-                return;
+                return CompletableFuture.failedFuture(new IllegalStateException("The dashboard session ended before the vision engine could start."));
             }
-            session.engine().start().whenComplete((unused, failure) -> {
+            return session.engine().start().whenComplete((unused, failure) -> {
                 if (active != session || closed) {
                     return;
                 }
@@ -232,7 +235,7 @@ public final class Main {
                 }
                 try {
                     session.context().audit("ENGINE_PROCESS_STARTED", "ingestion-engine",
-                            "Started only after the signed-in dashboard became visible.");
+                            "Started by dashboard startup or an authorised operator request.");
                 } catch (RuntimeException ignored) { }
             });
         }

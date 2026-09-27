@@ -208,6 +208,7 @@ final class CameraManagementPanel extends JPanel {
                 currentSettings.peopleDetectionIntervalFrames(),
                 currentSettings.quietAtOrAbovePeople(),
                 currentSettings.audibleAlertsEnabled(),
+                currentSettings.startEngineOnStartup(),
                 cameras);
     }
 

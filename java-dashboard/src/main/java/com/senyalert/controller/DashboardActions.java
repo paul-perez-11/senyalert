@@ -77,6 +77,14 @@ public interface DashboardActions {
 
     void toggleEnginePause();
 
+    /** Starts the dashboard-owned vision engine when it was not started automatically. */
+    default void startEngine() {
+    }
+
+    /** Persists whether the dashboard-owned engine starts after future sign-ins. */
+    default void setStartEngineOnStartup(boolean enabled) {
+    }
+
     /** Safely reconnects live camera workers without changing saved settings or evidence. */
     default void restartEngine() {
     }

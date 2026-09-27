@@ -1,5 +1,6 @@
 package com.senyalert.service;
 
+import com.senyalert.EnvironmentConfiguration;
 import com.senyalert.model.EngineSettings;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -38,11 +39,12 @@ public final class SettingsStore {
 
     public CompletableFuture<EngineSettings> load() {
         return CompletableFuture.supplyAsync(() -> {
+            boolean legacyStartupDefault = EnvironmentConfiguration.booleanValue("SENYALERT_ENGINE_AUTOSTART", true);
             if (!Files.isRegularFile(configPath)) {
-                return EngineSettings.defaults();
+                return EngineSettings.defaults(legacyStartupDefault);
             }
             try {
-                return EngineSettings.fromJson(readJson());
+                return EngineSettings.fromJson(readJson(), legacyStartupDefault);
             } catch (Exception invalidConfig) {
                 throw new IllegalStateException("Could not read the existing configuration. It was not changed; restore or replace it deliberately before saving settings.", invalidConfig);
             }

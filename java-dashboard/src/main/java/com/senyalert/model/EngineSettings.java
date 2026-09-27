@@ -28,6 +28,7 @@ public record EngineSettings(
         int peopleDetectionIntervalFrames,
         int quietAtOrAbovePeople,
         boolean audibleAlertsEnabled,
+        boolean startEngineOnStartup,
         List<CameraSettings> cameras) {
 
     public EngineSettings {
@@ -64,15 +65,25 @@ public record EngineSettings(
     }
 
     public static EngineSettings defaults() {
+        return defaults(true);
+    }
+
+    /** The supplied value is used only when an older local configuration has no saved startup preference. */
+    public static EngineSettings defaults(boolean startEngineOnStartup) {
         return new EngineSettings(
                 0.70, 1.50, 0.10, 0.10, 0.50, 0.75, 12, 12, true, true,
                 "0", "CAM-01-LAPTOP", "Public Intake Counter A",
-                2, true, 8, 4, true,
+                2, true, 8, 4, true, startEngineOnStartup,
                 List.of(new CameraSettings("0", "CAM-01-LAPTOP", "Public Intake Counter A")));
     }
 
     public static EngineSettings fromJson(JSONObject json) {
-        EngineSettings fallback = defaults();
+        return fromJson(json, true);
+    }
+
+    /** Supports the legacy environment default only while no saved checkbox preference exists. */
+    public static EngineSettings fromJson(JSONObject json, boolean startupDefault) {
+        EngineSettings fallback = defaults(startupDefault);
         JSONObject fingers = json.optJSONObject("fingers");
         List<CameraSettings> cameras = parseCameras(json.optJSONArray("cameras"));
         if (cameras.isEmpty()) {
@@ -114,6 +125,7 @@ public record EngineSettings(
                 json.optInt("people_detection_interval_frames", fallback.peopleDetectionIntervalFrames()),
                 json.optInt("quiet_at_or_above_people", fallback.quietAtOrAbovePeople()),
                 json.optBoolean("audible_alerts_enabled", fallback.audibleAlertsEnabled()),
+                json.optBoolean("start_engine_on_startup", fallback.startEngineOnStartup()),
                 cameras);
     }
 
@@ -164,7 +176,18 @@ public record EngineSettings(
     public JSONObject toPersistedJson() {
         JSONArray serializedCameras = new JSONArray();
         cameras.forEach(camera -> serializedCameras.put(camera.toJson()));
-        return toEngineJson().put("cameras", serializedCameras);
+        return toEngineJson().put("cameras", serializedCameras)
+                .put("start_engine_on_startup", startEngineOnStartup);
+    }
+
+    /** Changes only the dashboard-owned engine-launch preference. */
+    public EngineSettings withStartEngineOnStartup(boolean enabled) {
+        return new EngineSettings(
+                confidenceThreshold, gestureSensitivity, thumbTuckConfidenceBonus, indexFoldConfidenceBonus,
+                repeatedHandsignMinConfidence, repeatedHandsignConfidenceTarget, preEventSeconds, postEventSeconds,
+                requireThumb, requireIndex, cameraSource, cameraId, cameraLocation, maxHands,
+                peopleDetectionEnabled, peopleDetectionIntervalFrames, quietAtOrAbovePeople, audibleAlertsEnabled,
+                enabled, cameras);
     }
 
     private static int clamp(int value, int min, int max) {

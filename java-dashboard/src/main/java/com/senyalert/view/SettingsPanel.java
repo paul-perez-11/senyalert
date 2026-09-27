@@ -50,15 +50,20 @@ final class SettingsPanel extends JPanel {
     private final JSlider quietThreshold = new JSlider(1, 30, 4);
     private final JLabel quietThresholdValue = new JLabel();
     private final JCheckBox audibleEnabled = check("Allow audible alarms below the quiet threshold");
+    private final JCheckBox startEngineOnStartup = check("Start engine on startup");
     private final StyledButton saveButton = new StyledButton("Save & Apply", FontAwesomeSolid.CHECK, BlueTheme.PRIMARY);
+    private final StyledButton startButton = new StyledButton("Start Engine", FontAwesomeSolid.PLAY, BlueTheme.PRIMARY);
     private final StyledButton pauseButton = new StyledButton("Pause Engine", FontAwesomeSolid.PAUSE, BlueTheme.DEEP_BLUE);
     private final StyledButton restartButton = new StyledButton("Restart Engine", FontAwesomeSolid.SYNC, BlueTheme.DEEP_BLUE);
 
     private Consumer<EngineSettings> saveAction = ignored -> { };
+    private Consumer<Boolean> startupAction = ignored -> { };
+    private Runnable startAction = () -> { };
     private Runnable pauseAction = () -> { };
     private Runnable restartAction = () -> { };
     private List<CameraSettings> configuredCameras = EngineSettings.defaults().cameras();
     private Predicate<com.senyalert.security.Permission> allowed = ignored -> false;
+    private boolean synchronizingStartupPreference;
 
     SettingsPanel() {
         setLayout(new BorderLayout());
@@ -144,14 +149,23 @@ final class SettingsPanel extends JPanel {
                         JOptionPane.WARNING_MESSAGE);
             }
         });
+        startEngineOnStartup.setToolTipText("Save this immediately to start the dashboard-owned engine automatically after future sign-ins.");
+        startEngineOnStartup.addActionListener(event -> {
+            if (!synchronizingStartupPreference) startupAction.accept(startEngineOnStartup.isSelected());
+        });
+        startButton.setToolTipText("Launch the dashboard-owned vision engine now. Use this when automatic startup is disabled.");
+        startButton.addActionListener(event -> startAction.run());
         pauseButton.addActionListener(event -> pauseAction.run());
         restartButton.setToolTipText("Reconnect enabled camera workers without deleting evidence or changing saved settings.");
         restartButton.addActionListener(event -> confirmEngineRestart());
         showSettings(EngineSettings.defaults());
     }
 
-    void setActions(Consumer<EngineSettings> saveAction, Runnable pauseAction, Runnable restartAction) {
+    void setActions(Consumer<EngineSettings> saveAction, Consumer<Boolean> startupAction,
+            Runnable startAction, Runnable pauseAction, Runnable restartAction) {
         this.saveAction = saveAction;
+        this.startupAction = startupAction;
+        this.startAction = startAction;
         this.pauseAction = pauseAction;
         this.restartAction = restartAction;
     }
@@ -171,7 +185,9 @@ final class SettingsPanel extends JPanel {
         maxHands.setEnabled(canConfigure);
         peopleEnabled.setEnabled(canConfigure);
         audibleEnabled.setEnabled(canConfigure);
+        startEngineOnStartup.setEnabled(canConfigure);
         saveButton.setEnabled(canConfigure);
+        startButton.setEnabled(canConfigure);
         pauseButton.setEnabled(canConfigure);
         restartButton.setEnabled(canConfigure);
         String denied = "Requires the Configure engine settings permission.";
@@ -180,6 +196,9 @@ final class SettingsPanel extends JPanel {
                 : denied);
         pauseButton.setToolTipText(canConfigure
                 ? "Pause or resume incident detection in the connected engine."
+                : denied);
+        startButton.setToolTipText(canConfigure
+                ? "Launch the dashboard-owned vision engine now when automatic startup is disabled."
                 : denied);
         restartButton.setToolTipText(canConfigure
                 ? "Reconnect enabled camera workers without deleting evidence or changing saved settings."
@@ -206,6 +225,12 @@ final class SettingsPanel extends JPanel {
         peopleInterval.setValue(settings.peopleDetectionIntervalFrames());
         quietThreshold.setValue(settings.quietAtOrAbovePeople());
         audibleEnabled.setSelected(settings.audibleAlertsEnabled());
+        synchronizingStartupPreference = true;
+        try {
+            startEngineOnStartup.setSelected(settings.startEngineOnStartup());
+        } finally {
+            synchronizingStartupPreference = false;
+        }
         confidenceValue.setText(confidence.getValue() + "%");
         updateGestureSensitivityLabel();
         updateConfidenceTuningLabels();
@@ -269,7 +294,9 @@ final class SettingsPanel extends JPanel {
     private JPanel actions() {
         JPanel panel = new JPanel(new java.awt.FlowLayout(java.awt.FlowLayout.LEFT, 6, 0));
         panel.setOpaque(false);
+        panel.add(startEngineOnStartup);
         panel.add(saveButton);
+        panel.add(startButton);
         panel.add(pauseButton);
         panel.add(restartButton);
         return panel;
@@ -316,6 +343,7 @@ final class SettingsPanel extends JPanel {
                 (Integer) peopleInterval.getValue(),
                 quietThreshold.getValue(),
                 audibleEnabled.isSelected(),
+                startEngineOnStartup.isSelected(),
                 configuredCameras);
     }
 

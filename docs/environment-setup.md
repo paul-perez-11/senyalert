@@ -25,7 +25,7 @@ the project-root file.
 | `SENYALERT_DATA_DIR` | Existing local folder containing the SQLite databases and saved settings. SenyAlert never creates or moves this directory just because it is configured. |
 | `SENYALERT_PROJECT_ROOT` | Project folder containing `src/python-prototype.py` and the benchmark tools when automatic discovery is unsuitable. |
 | `SENYALERT_PYTHON` | Python executable used for the dashboard-owned ingestion engine and benchmark tools. Use an executable path only, without command arguments. |
-| `SENYALERT_ENGINE_AUTOSTART` | `true` by default. Set `false` only when an operator deliberately starts a separate local engine. |
+| `SENYALERT_ENGINE_AUTOSTART` | First-run default for the saved **Start engine on startup** checkbox. `false` starts with the owned engine off; use **Start Engine** manually. After the checkbox is saved, its setting is authoritative. |
 | `SENYALERT_WS_URL` | Python engine WebSocket endpoint. Leave the default `ws://localhost:8080` for the dashboard's local server. |
 | `SENYALERT_CLIENT_ID` | Required stable Remote Support installation ID for a new client. Use 8-128 letters, digits, dashes, or underscores; it is not a password. |
 | `SENYALERT_CLIENT_NAME` | Optional display label sent to the Superadmin Dashboard. |
@@ -42,15 +42,21 @@ not add it to the file.
 
 `python senyalert.py run` now starts the Java sign-in screen only. After a
 normal local user or administrator signs in and the main dashboard is visible,
-SenyAlert starts its own Python ingestion-engine child and the engine opens its
-OpenCV window. The separate Superadmin Dashboard does not start an ingestion
-engine.
+SenyAlert starts its own Python ingestion-engine child only when the saved
+**Start engine on startup** setting is checked. When it is unchecked, an
+authorised operator can use **Start Engine** in Settings > Engine settings.
+The separate Superadmin Dashboard does not start an ingestion engine.
 
 When that dashboard is signed out or closed, SenyAlert stops the exact Python
 process it launched and any descendants it owns, then closes the local
 WebSocket server. It never searches for or terminates unrelated Python
-processes. With `SENYALERT_ENGINE_AUTOSTART=false`, an externally launched
-engine remains independent and is never stopped by the dashboard.
+processes. An externally launched engine remains independent and is never
+stopped by the dashboard.
+
+Choosing **Exit** on the sign-in dialog closes the application runtime and
+terminates the Java launch process, so a `python senyalert.py run` or Maven
+launch returns to its calling terminal instead of leaving a login-only job
+running.
 
 ## Client-ID migration
 

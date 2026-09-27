@@ -3,8 +3,8 @@
 Remote Support creates a temporary SenyAlert API on `127.0.0.1` and asks
 `cloudflared` to expose only that temporary API through an HTTPS Quick Tunnel.
 It does not expose a local file browser, a shell, or the client computer's
-desktop. The client can stop the session at any time; sessions expire after 30
-minutes.
+desktop. The client chooses a session length from 1 to 120 minutes and can stop
+the session at any time.
 
 ## One-time setup
 
@@ -41,10 +41,17 @@ developer password can be turned into a verifier with
 `com.senyalert.security.SuperadminPasswordTool`; it never stores a plaintext
 password.
 
+The Remote Support tab conceals both the client ID and support key. **Copy
+Client ID** and **Copy Support Key** are the only in-app ways to place those
+values on the local clipboard, and each copy is written to the client audit
+log. For a real client installation, keep the support key separate from the
+support link. Do not send both in one message.
+
 ## Client support session
 
-1. The client confirms a support session with the developer, then opens
-   **Remote Support** and presses **Start support**.
+1. The client confirms a support session with the developer, chooses a whole
+   number of minutes from 1 to 120, then opens **Remote Support** and presses
+   **Start support**.
 2. When the state says the connection is ready, the client presses **Copy
    Link**. The link stays masked in the app and cannot be selected or revealed.
    Pressing the button creates an audit entry.
@@ -77,3 +84,27 @@ new-camera template.
 Every session start/stop, link generation/copy, denied request, snapshot, and
 remote action is recorded in the client audit log. The developer dashboard also
 records its client and template actions in its local audit store.
+
+## One-computer demonstration
+
+Run a client instance and a developer instance at the same time. They must use
+different existing data folders and different environment files, otherwise
+they would be the same installation rather than two demo roles.
+
+1. Create two existing empty folders, for example `demo-client-data` and
+   `demo-developer-data`.
+2. Create a client environment file containing its data folder,
+   `SENYALERT_CLIENT_ID`, `SENYALERT_SUPPORT_SECRET`, and
+   `SENYALERT_CLOUDFLARED`. Do not put the superadmin verifier in this file.
+3. Create a developer environment file containing its different data folder
+   and `SENYALERT_SUPERADMIN_PASSWORD_HASH`. Do not put the client support key
+   in this file.
+4. In terminal A, select the client file with `SENYALERT_ENV_FILE`, run
+   `python senyalert.py run`, sign in as a normal local administrator, then
+   start Remote Support for a short demonstration session. Copy the link and,
+   for this local demo, use the audited **Copy Support Key** button.
+5. In terminal B, select the developer file with `SENYALERT_ENV_FILE`, change
+   into `java-dashboard`, and run `mvn exec:java`. Sign in as `superadmin`,
+   choose **Connect client**, and paste the copied link and key.
+6. The Quick Tunnel still uses Cloudflare even though both roles are on the
+   same computer. Stop the client session when the demonstration is complete.

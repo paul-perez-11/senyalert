@@ -20,13 +20,13 @@ public final class CrowdPolicySmoke {
         AlertPolicy policy = new AlertPolicy();
         EngineSettings quietAtOne = new EngineSettings(
                 0.70, 1.50, 0.10, 0.10, 0.50, 0.75, 5, 5, true, true, "0", "CAM-LAPTOP", "Desk", 2,
-                true, 8, 1, true, EngineSettings.defaults().cameras());
+                true, 8, 1, true, true, EngineSettings.defaults().cameras());
         EngineSettings quietAtFour = new EngineSettings(
                 0.70, 1.50, 0.10, 0.10, 0.50, 0.75, 5, 5, true, true, "0", "CAM-LAPTOP", "Desk", 2,
-                true, 8, 4, true, EngineSettings.defaults().cameras());
+                true, 8, 4, true, true, EngineSettings.defaults().cameras());
         EngineSettings audibleDisabled = new EngineSettings(
                 0.70, 1.50, 0.10, 0.10, 0.50, 0.75, 5, 5, true, true, "0", "CAM-LAPTOP", "Desk", 2,
-                true, 8, 4, false, EngineSettings.defaults().cameras());
+                true, 8, 4, false, true, EngineSettings.defaults().cameras());
 
         expect("phone signaler floor honored", AlertMode.QUIET,
                 policy.decide(event("CAM-PHONE", 1, false, false), quietAtOne));

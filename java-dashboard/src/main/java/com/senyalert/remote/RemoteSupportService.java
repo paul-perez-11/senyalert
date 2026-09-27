@@ -30,6 +30,9 @@ import org.json.JSONObject;
 /** A deliberately bounded, temporary application support API, bound only to loopback. */
 public final class RemoteSupportService implements AutoCloseable {
     private static final int MAX_BODY = 262_144;
+    public static final int MIN_SESSION_MINUTES = 1;
+    public static final int DEFAULT_SESSION_MINUTES = 30;
+    public static final int MAX_SESSION_MINUTES = 120;
     private static final Pattern TUNNEL_URL = Pattern.compile("https://[a-z0-9-]+\\.trycloudflare\\.com");
     private static final Set<String> ACTIONS = Set.of("settings.update", "cameras.update",
             "incident.acknowledge", "incident.resolve", "incident.note", "users.create",
@@ -66,10 +69,16 @@ public final class RemoteSupportService implements AutoCloseable {
 
     /** Starts a public tunnel only after the client's explicit Start support action. */
     public CompletableFuture<Void> start() {
+        return start(Duration.ofMinutes(DEFAULT_SESSION_MINUTES));
+    }
+
+    /** Starts a public tunnel for the client-approved duration, bounded to one to 120 minutes. */
+    public CompletableFuture<Void> start(Duration requestedLifetime) {
+        Duration lifetime = validatedLifetime(requestedLifetime);
         return CompletableFuture.runAsync(() -> {
             try {
                 backend.validateReady();
-                URI local = startLocal(Duration.ofMinutes(30));
+                URI local = startLocal(lifetime);
                 String startingSession;
                 synchronized (this) {
                     startingSession = sessionId;
@@ -115,6 +124,7 @@ public final class RemoteSupportService implements AutoCloseable {
         if (active) throw new IllegalStateException("A support session is already active");
         if (supportKey == null || supportKey.length() < 32)
             throw new IllegalStateException("SENYALERT_SUPPORT_SECRET must contain at least 32 characters");
+        lifetime = validatedLifetime(lifetime);
         byte[] secret = new byte[32];
         new SecureRandom().nextBytes(secret);
         token = Base64.getUrlEncoder().withoutPadding().encodeToString(secret);
@@ -143,8 +153,29 @@ public final class RemoteSupportService implements AutoCloseable {
     public synchronized void copyLink() {
         if (!ready()) throw new IllegalStateException("Generate a support link first");
         audit("remote.link.copied", new JSONObject().put("destination", "system_clipboard"));
-        java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
-                .setContents(new java.awt.datatransfer.StringSelection(link), null);
+        copyToClipboard(link);
+    }
+
+    /** Copies the configured client ID only after an audit entry is committed. */
+    public synchronized void copyClientId() {
+        try {
+            String clientId = backend.supportClientId();
+            if (clientId == null || clientId.isBlank()) throw new IllegalStateException("A client installation ID is not configured.");
+            audit("remote.client_id.copied", new JSONObject().put("destination", "system_clipboard"));
+            copyToClipboard(clientId);
+        } catch (RuntimeException failure) {
+            throw failure;
+        } catch (Exception failure) {
+            throw new IllegalStateException("Could not copy the client installation ID.", failure);
+        }
+    }
+
+    /** Copies the configured support key only after an audit entry is committed. */
+    public synchronized void copySupportKey() {
+        if (supportKey == null || supportKey.length() < 32)
+            throw new IllegalStateException("SENYALERT_SUPPORT_SECRET must contain at least 32 characters");
+        audit("remote.support_key.copied", new JSONObject().put("destination", "system_clipboard"));
+        copyToClipboard(supportKey);
     }
 
     public synchronized void stop(String reason) {
@@ -253,6 +284,22 @@ public final class RemoteSupportService implements AutoCloseable {
         backend.audit(action, details.put("supportSession", sessionId == null ? "none" : sessionId)
                 .put("remotePrincipal", action.startsWith("remote.action.") || action.startsWith("remote.snapshot.")
                         ? "superadmin" : "local grantor or unauthenticated request"));
+    }
+
+    private static Duration validatedLifetime(Duration lifetime) {
+        if (lifetime == null) throw new IllegalArgumentException("Choose a support session length.");
+        long minutes = lifetime.toMinutes();
+        if (minutes < MIN_SESSION_MINUTES || minutes > MAX_SESSION_MINUTES
+                || !lifetime.equals(Duration.ofMinutes(minutes))) {
+            throw new IllegalArgumentException("Support sessions must last from " + MIN_SESSION_MINUTES
+                    + " to " + MAX_SESSION_MINUTES + " whole minutes.");
+        }
+        return lifetime;
+    }
+
+    private static void copyToClipboard(String value) {
+        java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
+                .setContents(new java.awt.datatransfer.StringSelection(value), null);
     }
 
     private static void reply(HttpExchange exchange, int status, JSONObject body) throws IOException {

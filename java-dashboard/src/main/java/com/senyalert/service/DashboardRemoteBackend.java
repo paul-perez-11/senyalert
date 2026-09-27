@@ -39,6 +39,12 @@ public final class DashboardRemoteBackend implements RemoteBackend {
         if (clientId == null) validateReady();
         return clientId;
     }
+
+    @Override public synchronized String supportClientId() {
+        validateReady();
+        return clientId;
+    }
+
     private SecurityContext context(String id) {
         grantor.require(Permission.REMOTE_SUPPORT);
         if (id == null || !id.matches("[A-Za-z0-9-]{8,128}")) throw new SecurityException("Invalid support session.");
@@ -144,7 +150,10 @@ public final class DashboardRemoteBackend implements RemoteBackend {
             SecurityContext old = sessions.remove(id); if (old != null) old.logout();
         } else if (action.startsWith("remote.action.") || action.startsWith("remote.snapshot.")) context(id).audit(action, "remote-support", details.toString());
         else {
-            if (action.equals("remote.session.started") || action.equals("remote.link.generated") || action.equals("remote.link.copied")) grantor.require(Permission.REMOTE_SUPPORT);
+            if (action.equals("remote.session.started") || action.equals("remote.link.generated") || action.equals("remote.link.copied")
+                    || action.equals("remote.client_id.copied") || action.equals("remote.support_key.copied")) {
+                grantor.require(Permission.REMOTE_SUPPORT);
+            }
             grantor.audit(action, "remote-support", details.toString());
         }
     }
