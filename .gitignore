@@ -12,6 +12,12 @@
 # Generated benchmark reports and measurements
 /benchmark-results/
 
+# Generated local analysis scratch files (renders, contact sheets, test harnesses)
+/tmp/
+
+# Generated trusted-read bridge artifacts
+/bridge/
+
 # Local database state, playback caches, and per-machine camera settings
 /java-dashboard/incidents.db*
 /java-dashboard/uploaded-incidents.db*
