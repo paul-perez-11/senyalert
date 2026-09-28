@@ -18,6 +18,12 @@
 # Generated trusted-read bridge artifacts
 /bridge/
 
+# Generated Codex artifact build, validation, and export files
+/.codex-work/
+/.codex-finalizer/
+/artifacts/
+node_modules/
+
 # Local database state, playback caches, and per-machine camera settings
 /java-dashboard/incidents.db*
 /java-dashboard/uploaded-incidents.db*
