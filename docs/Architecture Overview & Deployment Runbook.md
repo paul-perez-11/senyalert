@@ -22,7 +22,7 @@ The repository supports a source-based, single-workstation deployment. It has no
 
 ### Architecture diagram
 
-![SenyAlert event flow architecture](docs/images/SenyAlert-Event-Flow-Architecture.jpg)
+![SenyAlert event flow architecture](images/SenyAlert-Event-Flow-Architecture.jpg)
 
 *Figure 1. SenyAlert event flow from camera and uploaded-video producers through the local WebSocket transport, Java dashboard consumers, storage, audit history, and human operator actions.*
 
